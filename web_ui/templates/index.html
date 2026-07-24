@@ -1,0 +1,1097 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SQL → PySpark AI Converter | Ollama Powered</title>
+  <style>
+    :root {
+      --dark-blue:#1B3A6B; --med-blue:#2563EB; --light-bg:#F1F5F9;
+      --border:#D1D9E0; --success:#059669; --warn:#D97706;
+      --danger:#DC2626; --code-bg:#0D1117; --code-fg:#E6EDF3;
+      --live:#22C55E; --ai-purple:#7C3AED; --spark-orange:#EA580C;
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:"Segoe UI",Arial,sans-serif;background:var(--light-bg);color:#1A1A2E}
+    header{background:linear-gradient(135deg,#0C1B3A 0%,#1B3A6B 60%,#1E4585 100%);
+      color:white;padding:14px 28px;
+      display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;
+      box-shadow:0 3px 20px rgba(0,0,0,.45);border-bottom:1px solid rgba(255,255,255,.07)}
+    header h1{font-size:1.45rem;font-weight:800;letter-spacing:-.3px}
+    header .sub{font-size:.79rem;opacity:.7;margin-top:3px;display:block;letter-spacing:.2px}
+    .badge{background:var(--med-blue);color:white;padding:3px 10px;border-radius:20px;font-size:.75rem;font-weight:600}
+    .live-badge{display:inline-flex;align-items:center;gap:6px;background:#064E3B;color:#6EE7B7;
+      padding:4px 12px;border-radius:20px;font-size:.78rem;font-weight:600}
+    .live-dot{width:8px;height:8px;background:var(--live);border-radius:50%}
+    .live-dot.on{animation:pulse 1.2s infinite}
+    .live-dot.off{background:#64748B;animation:none}
+    @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(1.3)}}
+    .container{max-width:1460px;margin:0 auto;padding:16px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:15px}
+    @media(max-width:960px){.grid{grid-template-columns:1fr}}
+    .card{background:white;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.06),0 4px 14px rgba(0,0,0,.08);overflow:hidden;transition:box-shadow .2s,max-height .25s}
+    .card:hover{box-shadow:0 2px 8px rgba(0,0,0,.08),0 8px 28px rgba(0,0,0,.12)}
+    /* Maximized card — overlays the full viewport */
+    .card.maximized{position:fixed;inset:0;z-index:1000;border-radius:0;margin:0;display:flex;flex-direction:column;overflow:auto;box-shadow:none}
+    .card.maximized .card-body{flex:1;overflow:auto;display:flex;flex-direction:column}
+    .card.maximized .card-body>*{flex-shrink:0}
+    .card.maximized textarea{flex:1;min-height:0;height:100% !important;resize:none}
+    .card.maximized .code-output{flex:1;min-height:0;max-height:none !important;height:100% !important}
+    .card.maximized pre#quickOutput{max-height:none !important;height:calc(100vh - 220px) !important}
+    /* Dim background card when one is maximized */
+    .grid.has-maximized>.card:not(.maximized){visibility:hidden}
+    .maximize-btn{background:none;border:none;color:rgba(255,255,255,.75);cursor:pointer;font-size:1rem;padding:2px 6px;border-radius:5px;transition:background .15s;line-height:1;margin-left:6px}
+    .maximize-btn:hover{background:rgba(255,255,255,.18);color:white}
+    .card-header{background:linear-gradient(90deg,#1B3A6B 0%,#1D4E90 100%);color:white;padding:11px 16px;font-weight:600;font-size:.92rem;
+      display:flex;align-items:center;gap:7px;letter-spacing:.01em}
+    .card-body{padding:14px}
+    .toolbar{background:white;border-radius:10px;padding:10px 15px;margin-bottom:14px;
+      display:flex;flex-wrap:wrap;align-items:center;gap:9px;
+      box-shadow:0 1px 6px rgba(0,0,0,.07);border:1px solid var(--border)}
+    .toolbar label{font-size:.81rem;font-weight:600;color:var(--dark-blue);white-space:nowrap;margin:0}
+    .src-tabs{display:flex;border-radius:7px;overflow:hidden;border:1px solid var(--border)}
+    .src-tab{flex:1;text-align:center;padding:7px 14px;cursor:pointer;font-size:.82rem;font-weight:600;
+      color:#555;background:white;transition:background .15s,color .15s;border:none;outline:none}
+    .src-tab.active{background:var(--dark-blue);color:white}
+    .src-tab:not(:last-child){border-right:1px solid var(--border)}
+    #uploadZone{display:block;border:2px dashed var(--border);border-radius:10px;padding:30px 18px;
+      text-align:center;background:#FAFBFF;cursor:pointer;transition:border-color .2s,background .2s;margin-bottom:9px}
+    #uploadZone.dragover{border-color:var(--med-blue);background:#EBF3FB}
+    #uploadZone.has-file{border-color:var(--success);background:#F0FDF4}
+    #uploadZone .icon{font-size:2.4rem;margin-bottom:5px}
+    #uploadZone p{font-size:.85rem;color:#555;margin:3px 0}
+    #uploadZone .fname{font-weight:700;color:var(--dark-blue);font-size:.87rem;margin-top:4px}
+    #fileInput{display:none}
+    .upbtn{margin-top:7px;padding:6px 16px;background:var(--med-blue);color:white;border:none;
+      border-radius:6px;font-size:.83rem;font-weight:600;cursor:pointer}
+    .upbtn:hover{background:var(--dark-blue)}
+    label{display:block;font-size:.81rem;font-weight:600;color:var(--dark-blue);margin-bottom:3px}
+    textarea{width:100%;border:1px solid var(--border);border-radius:6px;padding:10px;
+      font-family:"Consolas","Courier New",monospace;font-size:.81rem;resize:vertical;
+      background:#FAFBFF;transition:border-color .2s}
+    textarea:focus{outline:none;border-color:var(--med-blue);box-shadow:0 0 0 3px rgba(46,116,181,.12)}
+    textarea.live-active{border-color:var(--live);box-shadow:0 0 0 3px rgba(34,197,94,.12)}
+    select,input[type=text]{width:100%;border:1px solid var(--border);border-radius:6px;
+      padding:6px 10px;font-size:.87rem;background:white}
+    select:focus,input[type=text]:focus{outline:none;border-color:var(--med-blue)}
+    .form-row{margin-bottom:10px}
+    .live-row{display:flex;align-items:center;gap:10px;margin-bottom:10px;
+      padding:11px 14px;background:#F0FDF4;border-radius:9px;
+      border:2px solid #86EFAC;transition:background .3s,border-color .3s;cursor:pointer}
+    .live-row.live-on{background:#DCFCE7;border-color:var(--live)}
+    .toggle{position:relative;width:48px;height:26px;cursor:pointer;flex-shrink:0}
+    .toggle input{opacity:0;width:0;height:0}
+    .slider2{position:absolute;inset:0;background:#CBD5E1;border-radius:26px;transition:background .25s}
+    .slider2::before{content:"";position:absolute;width:20px;height:20px;background:white;
+      border-radius:50%;left:3px;top:3px;transition:transform .25s;box-shadow:0 1px 4px rgba(0,0,0,.25)}
+    input:checked+.slider2{background:var(--live)}
+    input:checked+.slider2::before{transform:translateX(22px)}
+    .live-label{font-size:.88rem;font-weight:700;color:#166534}
+    .live-state{font-size:.78rem;font-weight:700;padding:2px 9px;border-radius:12px;
+      background:#BBF7D0;color:#065F46;white-space:nowrap}
+    .live-state.off{background:#F1F5F9;color:#64748B}
+    .live-hint{font-size:.74rem;color:#4B7563;margin-left:auto;font-style:italic}
+    #liveStatus{font-size:.76rem;color:#059669;font-weight:700;display:none;
+      animation:pulse 1s infinite}
+    .input-meta{display:flex;justify-content:space-between;font-size:.73rem;color:#9CA3AF;
+      margin-top:2px;margin-bottom:8px}
+    .btn{padding:8px 18px;border:none;border-radius:7px;font-size:.86rem;font-weight:600;
+      cursor:pointer;transition:all .18s;display:inline-flex;align-items:center;gap:6px;
+      box-shadow:0 1px 3px rgba(0,0,0,.12)}
+    .btn-primary{background:var(--med-blue);color:white}
+    .btn-primary:hover{background:var(--dark-blue);transform:translateY(-1px);box-shadow:0 3px 8px rgba(0,0,0,.2)}
+    .btn-secondary{background:#F1F5F9;color:var(--dark-blue);border:1px solid var(--border)}
+    .btn-secondary:hover{background:#E2E8F0}
+    .btn-success{background:var(--success);color:white}
+    .btn-group{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}
+    @keyframes btnPulse{0%,100%{box-shadow:0 0 0 0 rgba(46,116,181,.55)}60%{box-shadow:0 0 0 7px rgba(46,116,181,0)}}
+    @keyframes psGlow{0%{box-shadow:0 0 8px 3px rgba(255,230,80,.55);filter:brightness(1.7)}100%{box-shadow:0 0 20px 8px rgba(255,230,80,.9);filter:brightness(2.1)}}
+    .ps-active{animation:psGlow 1s ease-in-out infinite alternate;transform:scale(1.08);}
+    .btn-primary.needs-convert{animation:btnPulse 1.6s infinite;background:var(--dark-blue)}
+    .spinner{display:none;width:14px;height:14px;border:2.5px solid rgba(255,255,255,.3);
+      border-top-color:white;border-radius:50%;animation:spin .7s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .btn.loading .spinner{display:inline-block}
+    .btn.loading .btn-text{display:none}
+    .tabs{display:flex;border-bottom:2px solid var(--border);margin-bottom:12px}
+    .tab{padding:7px 14px;cursor:pointer;font-size:.84rem;font-weight:600;color:#666;
+      border-bottom:3px solid transparent;margin-bottom:-2px;transition:color .15s;white-space:nowrap}
+    .tab.active{color:var(--med-blue);border-bottom-color:var(--med-blue)}
+    .tab-content{display:none}
+    .tab-content.active{display:block}
+    .code-output{background:var(--code-bg);color:var(--code-fg);border-radius:8px;padding:14px;
+      font-family:"Consolas","Courier New",monospace;font-size:.79rem;line-height:1.65;
+      min-height:180px;max-height:420px;overflow-y:auto;
+      white-space:pre-wrap;word-break:break-word;overflow-x:auto;transition:opacity .2s}
+    .code-output.faded{opacity:.4}
+    .code-output.placeholder{color:#666;font-style:italic}
+    .analysis-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+    .stat-box{background:var(--light-bg);border-radius:8px;padding:8px 10px;text-align:center}
+    .stat-box .num{font-size:1.4rem;font-weight:700;color:var(--med-blue)}
+    .stat-box .lbl{font-size:.71rem;color:#555}
+    .cx{display:inline-block;padding:2px 10px;border-radius:20px;font-size:.76rem;font-weight:700}
+    .cx-lo{background:#DCFCE7;color:#166534}
+    .cx-mi{background:#FEF9C3;color:#713F12}
+    .cx-hi{background:#FEE2E2;color:#7F1D1D}
+    .warn-item{background:#FFF7ED;border-left:4px solid var(--warn);padding:7px 10px;
+      border-radius:0 6px 6px 0;font-size:.81rem;margin-bottom:5px;line-height:1.4}
+    .ref-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:7px;font-size:.79rem}
+    .ref-item{background:#F8FAFD;border-radius:6px;padding:6px 10px;
+      border-left:3px solid var(--med-blue);display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+    .prog-bar{height:4px;background:#E2E8F0;border-radius:2px;margin-top:6px;overflow:hidden;display:none}
+    .prog-fill{height:100%;background:var(--med-blue);width:0%;transition:width .3s;border-radius:2px}
+    #toast{position:fixed;bottom:20px;right:20px;background:var(--dark-blue);color:white;
+      padding:10px 18px;border-radius:8px;font-size:.875rem;box-shadow:0 4px 12px rgba(0,0,0,.25);
+      opacity:0;transition:opacity .3s;pointer-events:none;z-index:999;max-width:340px}
+    #toast.show{opacity:1}
+    ::-webkit-scrollbar{width:5px;height:5px}
+    ::-webkit-scrollbar-track{background:#f1f5f9}
+    ::-webkit-scrollbar-thumb{background:#94a3b8;border-radius:3px}
+  </style>
+</head>
+<body>
+ 
+<header>
+  <div>
+    <h1>&#9889; SQL &rarr; PySpark <span style="color:#93C5FD;">AI</span> Converter</h1>
+    <span class="sub">Rule-Based + AI Pipeline &mdash; T-SQL, ANSI SQL, Stored Procedures &rarr; Production PySpark SQL</span>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <span id="providerBadge" style="background:rgba(124,58,237,.3);color:#C4B5FD;border:1px solid rgba(196,181,253,.3);padding:4px 11px;border-radius:20px;font-size:.74rem;font-weight:700;letter-spacing:.3px;">&#129302; AI</span>
+    <span style="background:rgba(226,88,34,.25);color:#FCA57A;border:1px solid rgba(252,165,122,.3);padding:4px 11px;border-radius:20px;font-size:.74rem;font-weight:700;">&#9733; Apache Spark</span>
+    <span class="live-badge">
+      <span class="live-dot off" id="headerDot"></span>
+      <span id="headerLiveLabel">Live Mode: OFF</span>
+    </span>
+  </div>
+</header>
+ 
+<!-- Pipeline Banner -->
+<div style="background:linear-gradient(90deg,#0C1B3A,#1B3A6B,#1D4E90);color:white;padding:8px 28px;display:flex;align-items:center;justify-content:center;gap:0;flex-wrap:wrap;border-bottom:1px solid rgba(255,255,255,.08);">
+  <span style="font-size:.78rem;font-weight:600;opacity:.8;margin-right:8px;">PIPELINE:</span>
+  <span id="ps1" style="background:rgba(255,255,255,.12);padding:4px 14px;border-radius:20px;font-size:.76rem;font-weight:700;transition:all .35s ease;">&#128196; SQL Input</span>
+  <span style="margin:0 6px;opacity:.5;font-size:.85rem;">&rarr;</span>
+  <span id="ps2" style="background:rgba(255,255,255,.12);padding:4px 14px;border-radius:20px;font-size:.76rem;font-weight:700;transition:all .35s ease;">&#128269; Parse &amp; Analyze</span>
+  <span style="margin:0 6px;opacity:.5;font-size:.85rem;">&rarr;</span>
+  <span id="ps3" style="background:rgba(124,58,237,.4);padding:4px 14px;border-radius:20px;font-size:.76rem;font-weight:700;border:1px solid rgba(196,181,253,.3);transition:all .35s ease;">&#129302; Rule Engine + AI</span>
+  <span style="margin:0 6px;opacity:.5;font-size:.85rem;">&rarr;</span>
+  <span id="ps4" style="background:rgba(255,255,255,.12);padding:4px 14px;border-radius:20px;font-size:.76rem;font-weight:700;transition:all .35s ease;">&#9889; PySpark Code</span>
+  <span style="margin:0 6px;opacity:.5;font-size:.85rem;">&rarr;</span>
+  <span id="ps5" style="background:rgba(226,88,34,.4);padding:4px 14px;border-radius:20px;font-size:.76rem;font-weight:700;border:1px solid rgba(252,165,122,.3);transition:all .35s ease;">&#128640; Databricks Ready</span>
+</div>
+ 
+<div class="container">
+ 
+  <div class="toolbar">
+    <label>&#128196; Sample:</label>
+    <select id="sampleSelect" onchange="loadSample(this.value)" style="width:auto;min-width:195px;">
+      <option value="">&#8212; load a sample &#8212;</option>
+      {% for s in samples %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+    </select>
+    <div style="width:1px;height:24px;background:#CBD5E1;margin:0 2px;"></div>
+    <label style="margin:0;">SQL Type:</label>
+    <select id="dialect" style="width:auto;min-width:140px;">
+      <option value="tsql">🪟 SQL Server (T-SQL)</option>
+      <option value="ansi">📋 Standard SQL (ANSI)</option>
+      <option value="mysql">🐬 MySQL</option>
+      <option value="postgres">🐘 PostgreSQL</option>
+      <option value="oracle">🔶 Oracle (PL/SQL)</option>
+    </select>
+  </div>
+ 
+  <div class="grid">
+ 
+    <!-- INPUT -->
+    <div class="card" id="inputCard">
+      <div class="card-header">
+        &#128196; SQL Input
+        <span style="margin-left:auto;font-size:.72rem;opacity:.7;">Ctrl+Enter to convert</span>
+        <button class="maximize-btn" id="inputMaxBtn" onclick="toggleMaximize('inputCard','inputMaxBtn')" title="Maximize panel">&#x26F6;</button>
+      </div>
+      <div class="card-body">
+ 
+        <div class="form-row">
+          <div class="src-tabs">
+            <button class="src-tab active" onclick="switchInput('paste',this)">&#9998; Paste SQL</button>
+            <button class="src-tab"        onclick="switchInput('upload',this)">&#128194; Upload .sql File</button>
+          </div>
+        </div>
+ 
+        <!-- paste -->
+        <div id="pasteMode">
+          <textarea id="sqlInput" rows="20"
+            placeholder="-- Paste T-SQL / ANSI SQL here, or load a sample above.
+-- Ctrl+Enter to convert  |  toggle Live Mode for auto-convert.
+ 
+-- Example:
+SELECT dept, COUNT(*) AS emp_count
+FROM employees
+WHERE salary > 50000
+GROUP BY dept
+ORDER BY emp_count DESC;"></textarea>
+          <div class="input-meta">
+            <span id="charCount">0 characters</span>
+            <span id="lineCount">0 lines</span>
+          </div>
+        </div>
+ 
+        <!-- upload -->
+        <div id="uploadMode" style="display:none;">
+          <div id="uploadZone"
+               onclick="document.getElementById('fileInput').click()"
+               ondrop="handleDrop(event)"
+               ondragover="handleDragOver(event)"
+               ondragleave="handleDragLeave(event)">
+            <div class="icon">&#128196;</div>
+            <p><strong>Drag &amp; drop a .sql file here</strong></p>
+            <p style="color:#888;">or click the button below</p>
+            <p id="uploadedFileName" class="fname" style="display:none;"></p>
+            <button class="upbtn"
+                    onclick="event.stopPropagation();document.getElementById('fileInput').click()">
+              &#128194; Browse File
+            </button>
+          </div>
+          <input type="file" id="fileInput" accept=".sql,.txt" onchange="handleFileSelect(event)"/>
+          <div class="prog-bar" id="progBar"><div class="prog-fill" id="progFill"></div></div>
+          <div id="uploadPreview" style="display:none;margin-top:8px;">
+            <label>Preview (first 20 lines):</label>
+            <textarea id="previewText" rows="8" readonly
+              style="background:#F8FAFF;color:#333;font-size:.78rem;"></textarea>
+          </div>
+        </div>
+ 
+        <!-- live toggle -->
+        <div class="live-row" id="liveRow">
+          <label class="toggle" title="Toggle live conversion on/off">
+            <input type="checkbox" id="liveToggle" onchange="toggleLiveMode(this.checked)"/>
+            <span class="slider2"></span>
+          </label>
+          <span class="live-label">&#9889; Live Conversion</span>
+          <span class="live-state off" id="liveStateLabel">OFF &#8212; click to enable</span>
+          <span id="liveStatus">&#8226; Converting...</span>
+          <span class="live-hint" id="liveHint">Flip ON &#8594; PySpark updates as you type</span>
+        </div>
+ 
+        <div class="btn-group">
+          <button class="btn btn-primary" id="convertBtn" onclick="convertSQL()">
+            <span class="spinner"></span>
+            <span class="btn-text">&#9889; Convert to PySpark</span>
+          </button>
+          <button class="btn" id="aiBtn" onclick="convertWithAI()"
+            style="background:#7C3AED;color:white;display:none;"
+            title="Use AI for smarter conversion of complex SQL">
+            <span class="spinner"></span>
+            <span class="btn-text" id="aiBtnText">&#129302; AI Convert</span>
+          </button>
+          <button class="btn btn-secondary" onclick="clearAll()">&#128465; Clear</button>
+        </div>
+        <div id="aiStatus" style="font-size:.75rem;margin-top:6px;display:none;"></div>
+ 
+      </div>
+    </div>
+ 
+    <!-- OUTPUT -->
+    <div class="card" id="outputCard">
+      <div class="card-header">
+        &#128296; PySpark Output
+        <span id="outFilename" style="margin-left:auto;font-size:.71rem;opacity:.7;"></span>
+        <button class="maximize-btn" id="outputMaxBtn" onclick="toggleMaximize('outputCard','outputMaxBtn')" title="Maximize panel">&#x26F6;</button>
+      </div>
+      <div class="card-body">
+        <div class="tabs">
+          <div class="tab active" onclick="switchTab('tq',this)" id="quickTab">&#9889; Quick View</div>
+          <div class="tab"        onclick="switchTab('tc',this)">&#128196; Full File</div>
+          <div class="tab"        onclick="switchTab('ta',this)">&#128202; Analysis</div>
+          <div class="tab"        onclick="switchTab('tw',this)" id="warnTab">&#9888; Warnings</div>
+        </div>
+ 
+        <!-- Quick View tab (default) -->
+        <div id="tq" class="tab-content active">
+          <div id="quickViewPlaceholder" style="color:#888;font-size:.875rem;padding:12px 0;">
+            &#128161; Convert your SQL to instantly see the clean PySpark code here.
+          </div>
+          <div id="quickViewContent" style="display:none;">
+            <div style="font-size:.78rem;font-weight:700;color:#2563EB;margin-bottom:8px;">
+              &#9889; Converted PySpark SQL
+            </div>
+            <pre id="quickOutput" style="background:#0D1117;color:#E6EDF3;border-radius:8px;padding:14px;
+              font-family:'Consolas','Courier New',monospace;font-size:.8rem;line-height:1.65;
+              white-space:pre-wrap;word-break:break-word;min-height:120px;max-height:420px;overflow-y:auto;
+              border:1px solid #30363D;"></pre>
+            <pre id="sqlMirror" style="display:none;"></pre>
+          </div>
+          <div id="quickBtnGroup" class="btn-group" style="display:none;">
+            <button class="btn btn-success"   onclick="copyQuick()">&#128203; Copy PySpark</button>
+            <button class="btn btn-secondary" onclick="downloadCode()">&#11015; Download .py</button>
+
+          </div>
+        </div>
+ 
+        <!-- Full File tab -->
+        <div id="tc" class="tab-content">
+          <pre id="codeOutput" class="code-output placeholder"># Click "Convert" or enable Live Mode to see PySpark code here...</pre>
+          <div class="btn-group">
+            <button class="btn btn-success"   onclick="downloadCode()">&#11015; Download .py</button>
+            <button class="btn btn-secondary" id="jumpBtn" onclick="scrollToMainLogic(document.getElementById('codeOutput'), lastCode)" title="Scroll to your converted function" style="display:none;">&#9660; Jump to Logic</button>
+          </div>
+        </div>
+ 
+        <div id="ta" class="tab-content">
+          <div id="analysisDiv"><p style="color:#888;font-size:.875rem;">Convert SQL first.</p></div>
+        </div>
+        <div id="tw" class="tab-content">
+          <div id="warningsDiv"><p style="color:#888;font-size:.875rem;">Convert SQL first.</p></div>
+        </div>
+
+        <!-- Cursor Reference tab removed -->
+        <div id="tkc" class="tab-content" style="display:none!important;">
+          <div style="padding:4px 0 10px;">
+
+            <!-- Key difference banner -->
+            <div style="background:linear-gradient(135deg,#3B0764,#6D28D9);color:white;border-radius:10px;
+              padding:14px 18px;margin-bottom:14px;">
+              <div style="font-size:1rem;font-weight:800;margin-bottom:4px;">&#128260; SQL RDBMS Cursor vs PySpark</div>
+              <div style="font-size:.82rem;opacity:.9;">
+                SQL cursors iterate <strong>row-by-row on the database server</strong>.
+                PySpark processes data <strong>in bulk across a distributed cluster</strong>.
+                They are <strong>fundamentally different</strong> — direct translation causes performance disasters.
+              </div>
+            </div>
+
+            <!-- Warning box -->
+            <div style="background:#FEF3C7;border:2px solid #F59E0B;border-radius:8px;padding:10px 14px;margin-bottom:14px;
+              font-size:.82rem;color:#92400E;">
+              <strong>&#9888; NEVER use <code>.collect()</code> + Python loop in PySpark</strong><br/>
+              This loads <em>all rows into driver memory</em> — identical to the cursor anti-pattern.
+              On a 1 billion row table it will crash the driver node.
+            </div>
+
+            <!-- Comparison table -->
+            <div style="font-size:.8rem;font-weight:700;color:#4B5563;margin-bottom:6px;">&#128196; Conversion Mapping</div>
+            <div style="overflow-x:auto;">
+            <table style="width:100%;border-collapse:collapse;font-size:.8rem;">
+              <thead>
+                <tr style="background:#1A2F6F;color:white;">
+                  <th style="padding:8px 12px;text-align:left;border-radius:6px 0 0 0;">SQL RDBMS (Cursor)</th>
+                  <th style="padding:8px 12px;text-align:left;">Intent</th>
+                  <th style="padding:8px 12px;text-align:left;border-radius:0 6px 0 0;">PySpark Equivalent</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr style="background:#F8FAFF;">
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#DC2626;">DECLARE cur CURSOR FOR SELECT ...</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;color:#666;">Define source rows</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#16A34A;">source_df = spark.sql("SELECT ...")</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#DC2626;">OPEN cur</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;color:#666;">Open cursor</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#9CA3AF;"># no-op in Spark (lazy evaluation)</td>
+                </tr>
+                <tr style="background:#F8FAFF;">
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#DC2626;">FETCH NEXT INTO @vars</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;color:#666;">Get one row</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#9CA3AF;"># eliminated — Spark is set-based</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#DC2626;">UPDATE t SET col=@v WHERE id=@id</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;color:#666;">Update per row</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#16A34A;">spark.sql("UPDATE db.t SET col=val WHERE ...")<br/><span style="color:#9CA3AF;"># requires Delta Lake</span></td>
+                </tr>
+                <tr style="background:#F8FAFF;">
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#DC2626;">INSERT INTO t VALUES (@a, @b)</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;color:#666;">Insert per row</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#16A34A;">spark.sql("INSERT INTO db.t SELECT a, b FROM source")</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#DC2626;">DELETE FROM t WHERE id=@id</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;color:#666;">Delete per row</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#16A34A;">spark.sql("DELETE FROM db.t WHERE cond")<br/><span style="color:#9CA3AF;"># requires Delta Lake</span></td>
+                </tr>
+                <tr style="background:#F8FAFF;">
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#DC2626;">SET @col = func(@val)</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;color:#666;">Transform per row</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#16A34A;">df = df.withColumn("col", expr("func(val)"))</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#DC2626;">WHILE @@FETCH_STATUS = 0 ...</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;color:#666;">Loop</td>
+                  <td style="padding:8px 12px;border-bottom:1px solid #E2E8F0;font-family:monospace;color:#16A34A;">df.foreachPartition(func) <span style="color:#D97706;">&#9888; last resort</span></td>
+                </tr>
+                <tr style="background:#F8FAFF;">
+                  <td style="padding:8px 12px;font-family:monospace;color:#DC2626;">CLOSE / DEALLOCATE cur</td>
+                  <td style="padding:8px 12px;color:#666;">Release cursor</td>
+                  <td style="padding:8px 12px;font-family:monospace;color:#9CA3AF;"># no-op — Spark GC handles cleanup</td>
+                </tr>
+              </tbody>
+            </table>
+            </div>
+
+            <!-- Code examples side-by-side -->
+            <div style="margin-top:16px;font-size:.8rem;font-weight:700;color:#4B5563;margin-bottom:6px;">&#128196; Side-by-Side Code Example</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+              <div>
+                <div style="font-size:.75rem;font-weight:700;color:#DC2626;margin-bottom:4px;">&#10060; SQL RDBMS Cursor (do NOT port directly)</div>
+                <pre style="background:#1E1E2E;color:#FF6B6B;border-radius:8px;padding:12px;
+                  font-size:.75rem;line-height:1.6;white-space:pre;overflow-x:auto;
+                  border:1px solid #313244;margin:0;">DECLARE @id INT, @sal DECIMAL
+DECLARE emp_cur CURSOR FOR
+  SELECT emp_id, salary
+  FROM Employees
+  WHERE dept_id = 10
+
+OPEN emp_cur
+FETCH NEXT FROM emp_cur
+  INTO @id, @sal
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+  UPDATE Employees
+  SET salary = @sal * 1.1
+  WHERE emp_id = @id
+
+  FETCH NEXT FROM emp_cur
+    INTO @id, @sal
+END
+
+CLOSE emp_cur
+DEALLOCATE emp_cur</pre>
+              </div>
+              <div>
+                <div style="font-size:.75rem;font-weight:700;color:#16A34A;margin-bottom:4px;">&#9989; PySpark Equivalent (bulk, distributed)</div>
+                <pre style="background:#1E1E2E;color:#A6E3A1;border-radius:8px;padding:12px;
+                  font-size:.75rem;line-height:1.6;white-space:pre;overflow-x:auto;
+                  border:1px solid #313244;margin:0;">from pyspark.sql import SparkSession
+
+def raise_salaries(
+    spark: SparkSession,
+    dept_id: int = 10
+):
+    """
+    Raise salary by 10% for all employees
+    in the given department.
+    Replaces row-by-row cursor with one
+    bulk Delta Lake UPDATE.
+    """
+    # NOTE: SQL cursor replaced with
+    # single bulk UPDATE (set-based)
+    spark.sql(f"""
+        UPDATE my_db.Employees
+        SET salary = salary * 1.1
+        WHERE dept_id = {dept_id}
+    """)
+
+    result_df = spark.sql(f"""
+        SELECT emp_id, salary
+        FROM my_db.Employees
+        WHERE dept_id = {dept_id}
+    """)
+    print("Updated rows:", result_df.count())
+    result_df.show(10, truncate=False)
+    return result_df</pre>
+              </div>
+            </div>
+
+            <!-- Performance note -->
+            <div style="margin-top:14px;background:#EFF6FF;border-left:4px solid #3B82F6;
+              border-radius:0 8px 8px 0;padding:10px 14px;font-size:.81rem;color:#1E40AF;">
+              <strong>&#128640; Performance impact:</strong>
+              A cursor processing 1M rows takes <strong>hours</strong> in SQL Server.
+              The PySpark bulk UPDATE on a Delta table with Databricks runs in
+              <strong>seconds</strong> — parallelised across all worker nodes.
+            </div>
+
+          </div>
+        </div>
+        <!-- /Cursor Reference tab -->
+      </div>
+    </div>
+  </div><!-- /grid -->
+ 
+  <!-- quick reference -->
+  <div class="card" style="margin-top:15px;">
+    <div class="card-header">&#128214; Quick Reference &#8212; SQL &#8594; PySpark Mapping</div>
+    <div class="card-body">
+      <div class="ref-grid">
+        {% for sql, pyspark in quick_ref %}
+        <div class="ref-item">
+          <code style="color:#1F3564;font-weight:700;">{{ sql }}</code>
+          <span style="color:#aaa;">&#8594;</span>
+          <code style="color:#2E8B57;">{{ pyspark }}</code>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+ 
+</div>
+ 
+<!-- Footer -->
+<div style="text-align:center;padding:18px;margin-top:8px;font-size:.74rem;color:#94A3B8;border-top:1px solid var(--border);background:white;">
+  <span style="font-weight:700;color:#1A2F6F;">&#9889; SQL &rarr; PySpark AI Converter</span>
+  &nbsp;&bull;&nbsp; Built with Python &bull; Flask &bull; sqlglot &bull; Ollama AI
+</div>
+ 
+<div id="toast"></div>
+ 
+<script>
+  var lastCode="", lastQuickCode="", lastSpName="converted_query";
+  var liveMode=false, debounceTimer=null;
+  var inputMode="paste", uploadedSQL="";
+ 
+  function switchInput(mode, btn) {
+    inputMode = mode;
+    document.querySelectorAll(".src-tab").forEach(function(b){b.classList.remove("active");});
+    btn.classList.add("active");
+    document.getElementById("pasteMode").style.display  = mode==="paste"  ? "block" : "none";
+    document.getElementById("uploadMode").style.display = mode==="upload" ? "block" : "none";
+  }
+ 
+  function getSQL() {
+    return inputMode==="upload" ? uploadedSQL
+           : document.getElementById("sqlInput").value.trim();
+  }
+ 
+  function toggleLiveMode(on) {
+    liveMode = on;
+    document.getElementById("headerDot").className = "live-dot " + (on ? "on" : "off");
+    document.getElementById("headerLiveLabel").textContent = on ? "Live Mode: ON" : "Live Mode: OFF";
+    document.getElementById("liveHint").textContent = on
+      ? "Typing pauses 700ms \u2192 auto-converts"
+      : "Flip ON \u2192 PySpark updates as you type";
+    document.getElementById("liveStateLabel").textContent = on ? "ON \u2014 typing auto-converts" : "OFF \u2014 click to enable";
+    document.getElementById("liveStateLabel").className = on ? "live-state" : "live-state off";
+    document.getElementById("liveRow").classList.toggle("live-on", on);
+    document.getElementById("sqlInput").classList.toggle("live-active", on);
+    if (on) { document.getElementById("sqlInput").focus(); }
+  }
+ 
+  var ta = document.getElementById("sqlInput");
+  ta.addEventListener("input", function() {
+    var t = ta.value;
+    document.getElementById("charCount").textContent = t.length.toLocaleString() + " characters";
+    document.getElementById("lineCount").textContent = t.split("\n").length.toLocaleString() + " lines";
+    if (liveMode) {
+      clearTimeout(debounceTimer);
+      document.getElementById("liveStatus").style.display = "inline";
+      document.getElementById("codeOutput").classList.add("faded");
+      debounceTimer = setTimeout(function(){
+        document.getElementById("liveStatus").style.display = "none";
+        convertSQL(true);
+      }, 700);
+    } else if (t.trim().length > 5) {
+      // Pulse the convert button to remind user to click it
+      document.getElementById("convertBtn").classList.add("needs-convert");
+    }
+  });
+  ta.addEventListener("keydown", function(e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); convertSQL(); }
+  });
+ 
+  function convertSQL(silent) {
+    silent = silent || false;
+    var sql = getSQL();
+    var db  = "";
+    if (!sql) { if (!silent) showToast("Please enter or upload SQL first.","warn"); return; }
+    var btn = document.getElementById("convertBtn");
+    if (!silent) { btn.classList.add("loading"); btn.disabled=true; }
+    var out = document.getElementById("codeOutput");
+    out.classList.add("faded");
+    fetch("/convert", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({sql:sql, db_prefix:db})
+    }).then(function(r){ return r.json(); })
+    .then(function(d) {
+      out.classList.remove("faded");
+      if (d.error) {
+        out.textContent = "# ERROR: " + d.error;
+        out.classList.add("placeholder");
+        if (!silent) showToast("Conversion error.","error");
+      } else {
+        lastCode      = d.code;
+        lastQuickCode = d.quick_code || "";
+        lastSpName    = d.sp_name || "query";
+ 
+        // Populate Full File tab
+        out.textContent = d.code;
+        out.classList.remove("placeholder");
+        document.getElementById("outFilename").textContent = lastSpName + "_pyspark.py";
+        document.getElementById("jumpBtn").style.display = "inline-flex";
+        scrollToMainLogic(out, d.code);
+ 
+        // Populate Quick View tab — always switch here first
+        renderQuickView(d.quick_code || "", getSQL());
+        switchTab("tq", document.querySelectorAll(".tab")[0]);
+        document.getElementById("convertBtn").classList.remove("needs-convert");
+ 
+        renderAnalysis(d.analysis);
+        renderWarnings(d.warnings);
+        if (!silent) showToast("Conversion complete!","success");
+      }
+    }).catch(function(e) {
+      out.classList.remove("faded");
+      if (!silent) showToast("Request failed: "+e.message,"error");
+    }).finally(function() {
+      if (!silent) { btn.classList.remove("loading"); btn.disabled=false; }
+    });
+  }
+ 
+  function scrollToMainLogic(preEl, code) {
+    // Scroll the output <pre> so the function def is at the top of the visible area
+    var anchor = "def run_query(";
+    // Try SP function name first
+    var spMatch = code.match(/def (\w+)\s*\(/);
+    if (spMatch) anchor = "def " + spMatch[1] + "(";
+    var idx = code.indexOf(anchor);
+    if (idx < 0) { idx = code.indexOf("# ── Main logic"); }
+    if (idx < 0) { preEl.scrollTop = 0; return; }
+    var linesBefore = code.substring(0, idx).split("\n").length - 1;
+    // 0.79rem * 1.65 line-height ≈ 13px per line at 96dpi
+    preEl.scrollTop = Math.max(0, (linesBefore - 1) * 13);
+  }
+ 
+  function handleDragOver(e) { e.preventDefault(); document.getElementById("uploadZone").classList.add("dragover"); }
+  function handleDragLeave() { document.getElementById("uploadZone").classList.remove("dragover"); }
+  function handleDrop(e) {
+    e.preventDefault();
+    document.getElementById("uploadZone").classList.remove("dragover");
+    var file = e.dataTransfer.files[0];
+    if (file) processUpload(file);
+  }
+  function handleFileSelect(e) { if (e.target.files[0]) processUpload(e.target.files[0]); }
+ 
+  function processUpload(file) {
+    var ext = file.name.split(".").pop().toLowerCase();
+    if (["sql","txt"].indexOf(ext) < 0) { showToast("Only .sql or .txt files supported.","warn"); return; }
+    var zone = document.getElementById("uploadZone");
+    var bar  = document.getElementById("progBar");
+    var fill = document.getElementById("progFill");
+    zone.classList.add("has-file"); bar.style.display="block"; fill.style.width="40%";
+    var fd = new FormData(); fd.append("file", file);
+    fill.style.width = "70%";
+    fetch("/upload", {method:"POST", body:fd})
+    .then(function(r){ fill.style.width="100%"; return r.json(); })
+    .then(function(d) {
+      setTimeout(function(){ bar.style.display="none"; fill.style.width="0%"; }, 500);
+      if (d.error) { showToast("Upload failed: "+d.error,"error"); zone.classList.remove("has-file"); return; }
+      uploadedSQL = d.content;
+      var fn = document.getElementById("uploadedFileName");
+      fn.textContent = d.filename + "  (" + (d.size/1024).toFixed(1) + " KB)";
+      fn.style.display = "block";
+      var lines = d.content.split("\n").slice(0,20).join("\n");
+      document.getElementById("previewText").value = lines + (d.content.split("\n").length>20 ? "\n...(truncated)" : "");
+      document.getElementById("uploadPreview").style.display = "block";
+      showToast("File loaded: " + d.filename + " — click Convert!","success");
+      if (liveMode) convertSQL(true);
+    }).catch(function(err) {
+      bar.style.display="none";
+      showToast("Upload error: "+err.message,"error");
+      zone.classList.remove("has-file");
+    });
+  }
+ 
+  function loadSample(filename) {
+    if (!filename) return;
+    fetch("/sample/" + encodeURIComponent(filename))
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (d.content) {
+        switchInput("paste", document.querySelectorAll(".src-tab")[0]);
+        ta.value = d.content;
+        ta.dispatchEvent(new Event("input"));
+        showToast("Loaded: " + filename);
+        if (liveMode) convertSQL(true);
+      }
+    });
+  }
+ 
+  function renderQuickView(quickCode, sqlInput) {
+    document.getElementById("quickViewPlaceholder").style.display = "none";
+    document.getElementById("quickViewContent").style.display     = "block";
+    document.getElementById("quickBtnGroup").style.display        = "flex";
+    document.getElementById("sqlMirror").textContent  = sqlInput || "";
+    document.getElementById("quickOutput").textContent = quickCode || "";
+  }
+ 
+  function copyQuick() {
+    if (!lastQuickCode) { showToast("Nothing to copy yet.","warn"); return; }
+    navigator.clipboard.writeText(lastQuickCode)
+      .then(function(){ showToast("PySpark code copied!","success"); })
+      .catch(function(){ showToast("Copy failed.","error"); });
+  }
+ 
+  function copyCode() {
+    if (!lastCode) { showToast("Nothing to copy yet.","warn"); return; }
+    navigator.clipboard.writeText(lastCode)
+      .then(function(){ showToast("Full file copied!"); })
+      .catch(function(){ showToast("Copy failed.","error"); });
+  }
+  function downloadCode() {
+    if (!lastCode) { showToast("Nothing to download.","warn"); return; }
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([lastCode],{type:"text/plain"}));
+    a.download = lastSpName.toLowerCase().replace(/\s+/g,"_") + "_pyspark.py";
+    a.click(); URL.revokeObjectURL(a.href);
+    showToast("Downloaded: " + a.download);
+  }
+  function clearAll() {
+    ta.value=""; uploadedSQL="";
+    ["uploadedFileName","uploadPreview"].forEach(function(id){ document.getElementById(id).style.display="none"; });
+    document.getElementById("uploadZone").classList.remove("has-file");
+    document.getElementById("sampleSelect").value="";
+    document.getElementById("fileInput").value="";
+    var out = document.getElementById("codeOutput");
+    out.textContent="# Cleared."; out.classList.add("placeholder");
+    document.getElementById("outFilename").textContent="";
+    document.getElementById("charCount").textContent="0 characters";
+    document.getElementById("lineCount").textContent="0 lines";
+    document.getElementById("analysisDiv").innerHTML="<p style='color:#888;font-size:.875rem;'>Convert SQL first.</p>";
+    document.getElementById("warningsDiv").innerHTML="<p style='color:#888;font-size:.875rem;'>Convert SQL first.</p>";
+    // Reset quick view
+    document.getElementById("quickViewPlaceholder").style.display="block";
+    document.getElementById("quickViewContent").style.display="none";
+    document.getElementById("quickBtnGroup").style.display="none";
+    document.getElementById("sqlMirror").textContent="";
+    document.getElementById("quickOutput").textContent="";
+    switchTab("tq", document.querySelectorAll(".tab")[0]);
+    lastCode=""; lastQuickCode="";
+  }
+ 
+  function switchTab(id, btn) {
+    document.querySelectorAll(".tab-content").forEach(function(t){ t.classList.remove("active"); });
+    document.querySelectorAll(".tab").forEach(function(t){ t.classList.remove("active"); });
+    document.getElementById(id).classList.add("active");
+    if (btn) btn.classList.add("active");
+  }
+ 
+  function renderAnalysis(a) {
+    if (!a) return;
+    var cc = a.complexity_score>=7 ? "cx cx-hi" : a.complexity_score>=4 ? "cx cx-mi" : "cx cx-lo";
+    var rows = [
+      ["SP Name",           a.sp_name || "&mdash;"],
+      ["Type",              a.is_sp ? "Stored Procedure" : "SQL Query"],
+      ["Has Cursors",       a.has_cursors      ? "<span style='color:#D97706;font-weight:600;'>&#9888; Yes</span>" : "&#10003; No"],
+      ["Has Transactions",  a.has_transactions ? "<span style='color:#D97706;font-weight:600;'>&#9888; Yes</span>" : "&#10003; No"],
+      ["Has Dynamic SQL",   a.has_dynamic_sql  ? "<span style='color:#D97706;font-weight:600;'>&#9888; Yes</span>" : "&#10003; No"],
+      ["Window Functions",  a.has_window ? "&#10003; Yes" : "No"],
+      ["Table Dependencies",a.dependencies.join(", ") || "&mdash;"],
+    ];
+    var tableRows = rows.map(function(r) {
+      return "<tr><td style='padding:4px 9px;border-bottom:1px solid #f1f5f9;color:#555;'>" + r[0] +
+             "</td><td style='padding:4px 9px;border-bottom:1px solid #f1f5f9;'>" + r[1] + "</td></tr>";
+    }).join("");
+    document.getElementById("analysisDiv").innerHTML =
+      "<div class='analysis-grid'>" +
+        "<div class='stat-box'><div class='num'>" + a.param_count + "</div><div class='lbl'>Parameters</div></div>" +
+        "<div class='stat-box'><div class='num'>" + a.temp_table_count + "</div><div class='lbl'>Temp Tables</div></div>" +
+        "<div class='stat-box'><div class='num'>" + a.stmt_count + "</div><div class='lbl'>Statements</div></div>" +
+        "<div class='stat-box'><div class='num'>" + a.dep_count + "</div><div class='lbl'>Table Deps</div></div>" +
+        "<div class='stat-box'><div class='num'>" + a.warning_count + "</div><div class='lbl'>Warnings</div></div>" +
+        "<div class='stat-box'><div class='num'><span class='" + cc + "'>" + a.complexity_score + "/10</span></div><div class='lbl'>Complexity</div></div>" +
+      "</div>" +
+      "<table style='width:100%;font-size:.82rem;border-collapse:collapse;'>" +
+        "<tr style='background:#F0F4FA;'><th style='text-align:left;padding:5px 9px;border-bottom:1px solid #e2e8f0;'>Property</th>" +
+        "<th style='text-align:left;padding:5px 9px;border-bottom:1px solid #e2e8f0;'>Value</th></tr>" +
+        tableRows +
+      "</table>";
+  }
+ 
+  function renderWarnings(w) {
+    var tab = document.getElementById("warnTab");
+    if (!w || !w.length) {
+      document.getElementById("warningsDiv").innerHTML = "<p style='color:#16A34A;font-weight:600;'>&#10003; No conversion warnings.</p>";
+      tab.innerHTML = "&#9888; Warnings";
+      return;
+    }
+    tab.innerHTML = "&#9888; Warnings <span style='background:#DC2626;color:white;border-radius:10px;padding:1px 7px;font-size:.72rem;'>" + w.length + "</span>";
+    document.getElementById("warningsDiv").innerHTML =
+      "<p style='margin-bottom:8px;font-size:.83rem;color:#555;'>" + w.length + " warning(s):</p>" +
+      w.map(function(x){ return "<div class='warn-item'>&#9888; " + x + "</div>"; }).join("");
+  }
+ 
+  function showToast(msg, type) {
+    type = type || "info";
+    var el = document.getElementById("toast");
+    el.textContent = msg;
+    el.style.background = type==="error"?"#DC2626":type==="warn"?"#D97706":type==="success"?"#16A34A":"#1F3564";
+    el.classList.add("show");
+    setTimeout(function(){ el.classList.remove("show"); }, 3000);
+  }
+ 
+  // ── Maximize / Minimize panel ────────────────────────────────────────────
+  var _maximizedCard = null;
+
+  function toggleMaximize(cardId, btnId) {
+    var card  = document.getElementById(cardId);
+    var btn   = document.getElementById(btnId);
+    var grid  = document.querySelector(".grid");
+
+    if (_maximizedCard === cardId) {
+      // ── Restore ──────────────────────────────────────────────────────────
+      card.classList.remove("maximized");
+      grid.classList.remove("has-maximized");
+      btn.innerHTML   = "&#x26F6;";
+      btn.title       = "Maximize panel";
+      document.body.style.overflow = "";
+      _maximizedCard  = null;
+    } else {
+      // Restore any previously maximized card first
+      if (_maximizedCard) {
+        var prev    = document.getElementById(_maximizedCard);
+        var prevBtn = document.getElementById(
+          _maximizedCard === "inputCard" ? "inputMaxBtn" : "outputMaxBtn"
+        );
+        if (prev)    prev.classList.remove("maximized");
+        if (prevBtn) { prevBtn.innerHTML = "&#x26F6;"; prevBtn.title = "Maximize panel"; }
+      }
+      // ── Maximize ─────────────────────────────────────────────────────────
+      card.classList.add("maximized");
+      grid.classList.add("has-maximized");
+      btn.innerHTML   = "&#x26F7;";
+      btn.title       = "Restore panel";
+      document.body.style.overflow = "hidden";
+      _maximizedCard  = cardId;
+    }
+  }
+
+  // Escape key restores maximized panel
+  document.addEventListener("keydown", function(e) {
+    if (e.key === "Escape" && _maximizedCard) {
+      var btnId = _maximizedCard === "inputCard" ? "inputMaxBtn" : "outputMaxBtn";
+      toggleMaximize(_maximizedCard, btnId);
+    }
+  });
+
+
+ 
+  // Check AI status on load and show/hide AI buttons
+  (function checkAIStatus() {
+    fetch("/ai-status").then(function(r){ return r.json(); }).then(function(d) {
+      var aiAvailable = d.available;
+      var aiBtn = document.getElementById("aiBtn");
+      var statusEl = document.getElementById("aiStatus");
+      var provider = (d.provider || "AI");
+      var model    = (d.model || "");
+      var label    = provider + " / " + model;
+      if (aiAvailable) {
+        aiBtn.style.display = "inline-flex";
+        statusEl.style.display = "block";
+        document.getElementById("aiBtnText").textContent = "\u{1F916} AI Convert (" + provider + ")";
+        document.getElementById("providerBadge").textContent = "\u{1F916} " + label;
+        document.getElementById("ps3").textContent = "\u{1F916} Rule Engine + " + provider;
+        statusEl.innerHTML = "<span style='color:#7C3AED;font-weight:600;'>&#129302; " + label + " ready</span> &mdash; AI Convert uses " + provider + " for smarter SQL\u2192PySpark SQL conversion.";
+      } else {
+        statusEl.style.display = "block";
+        statusEl.innerHTML = "<span style='color:#9CA3AF;'>&#9888; AI not configured &mdash; start Ollama or set an API key in <code>.env</code>.</span>";
+      }
+    }).catch(function(){});
+  })();
+ 
+  // Animated progress dots while Ollama is generating
+  var _aiTimer = null;
+
+  // Pipeline step glow — lights up one step badge at a time
+  function _litPipelineStep(n) {
+    [1,2,3,4,5].forEach(function(i) {
+      var el = document.getElementById("ps" + i);
+      if (el) el.classList.remove("ps-active");
+    });
+    if (n) {
+      var el = document.getElementById("ps" + n);
+      if (el) el.classList.add("ps-active");
+    }
+  }
+
+  function _startAIProgress(out) {
+    var steps = [
+      "\u23F3 Step 1/7 \u2014 Analysing SQL structure\u2026",
+      "\u23F3 Step 2/7 \u2014 Mapping objects to Spark equivalents\u2026",
+      "\u23F3 Step 3/7 \u2014 Rewriting queries as spark.sql(\u2026)\u2026",
+      "\u23F3 Step 4/7 \u2014 Converting procedural logic\u2026",
+      "\u23F3 Step 5/7 \u2014 Handling transactions \u2192 Delta Lake\u2026",
+      "\u23F3 Step 6/7 \u2014 Optimising for Databricks\u2026",
+      "\u23F3 Step 7/7 \u2014 Building validation scaffold\u2026",
+      "\u23F3 Finalising \u2014 cleaning and formatting code\u2026"
+    ];
+    var idx = 0;
+    out.textContent = steps[0];
+    _aiTimer = setInterval(function() {
+      idx = (idx + 1) % steps.length;
+      out.textContent = steps[idx];
+    }, 3500);
+  }
+  function _stopAIProgress() {
+    if (_aiTimer) { clearInterval(_aiTimer); _aiTimer = null; }
+  }
+
+  function convertWithAI() {
+    var sql = getSQL();
+    var db  = "";
+    var dialect = document.getElementById("dialect").options[document.getElementById("dialect").selectedIndex].text;
+    if (!sql) { showToast("Please enter or upload SQL first.", "warn"); return; }
+
+    var btn = document.getElementById("aiBtn");
+    btn.classList.add("loading"); btn.disabled = true;
+
+    var out = document.getElementById("codeOutput");
+    var qOut = document.getElementById("quickOutput");
+    out.classList.remove("placeholder", "faded");
+
+    // Switch to Quick View immediately and show progress there
+    document.getElementById("quickViewPlaceholder").style.display = "none";
+    document.getElementById("quickViewContent").style.display = "block";
+    qOut.textContent = "\u23F3 Starting AI conversion\u2026";
+    switchTab("tq", document.querySelectorAll(".tab")[0]);
+    _litPipelineStep(1);
+    _startAIProgress(out);
+
+    // Use SSE stream — works with both old and new cached JS because the server
+    // now sends only lightweight [STEP] progress events + one clean [RESULT] event.
+    fetch("/ai-convert-stream", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({sql: sql, db_prefix: db, dialect: dialect})
+    }).then(function(response) {
+      if (!response.ok) {
+        return response.json().then(function(d){ throw new Error(d.error || "HTTP " + response.status); });
+      }
+      var reader  = response.body.getReader();
+      var decoder = new TextDecoder();
+      var sseBuf  = "";
+
+      function pump() {
+        reader.read().then(function(chunk) {
+          if (chunk.done) { _stopAIProgress(); btn.classList.remove("loading"); btn.disabled = false; return; }
+          sseBuf += decoder.decode(chunk.value, {stream: true});
+          var lines = sseBuf.split("\n");
+          sseBuf = lines.pop();
+
+          lines.forEach(function(line) {
+            if (!line.startsWith("data: ")) return;
+            var payload = line.slice(6);
+
+            if (payload === "[DONE]") {
+              btn.classList.remove("loading"); btn.disabled = false;
+              return;
+            }
+            if (payload.startsWith("[ERROR]")) {
+              _stopAIProgress();
+              _litPipelineStep(0);
+              var msg = payload.slice(7).trim();
+              try { msg = JSON.parse(msg); } catch(e){}
+              out.textContent = "# AI ERROR: " + msg;
+              showToast("AI Error: " + msg, "error");
+              btn.classList.remove("loading"); btn.disabled = false;
+              return;
+            }
+            if (payload.startsWith("[STEP] ")) {
+              // Show pipeline stage progress in both output areas
+              var stepText = "\u23F3 " + payload.slice(7);
+              out.textContent = stepText;
+              qOut.textContent = stepText;
+              // Light up the matching pipeline step
+              if (payload.indexOf("1/3") >= 0) _litPipelineStep(2);
+              else if (payload.indexOf("2/3") >= 0) _litPipelineStep(3);
+              else if (payload.indexOf("3/3") >= 0) _litPipelineStep(4);
+              return;
+            }
+            if (payload.startsWith("[RESULT] ")) {
+              _stopAIProgress();
+              try {
+                var d         = JSON.parse(payload.slice(9));
+                var cleanCode = d.code || "";
+                lastCode      = cleanCode;
+                lastQuickCode = cleanCode;
+                lastSpName    = d.sp_name || "ai_query";
+
+                out.textContent = cleanCode;
+                out.classList.remove("placeholder");
+                document.getElementById("outFilename").textContent =
+                  "\uD83E\uDD16 Ollama AI \u2014 " + lastSpName + "_pyspark.py";
+
+                renderQuickView(cleanCode, sql);
+                switchTab("tq", document.querySelectorAll(".tab")[0]);
+                document.getElementById("quickBtnGroup").style.display = "flex";
+
+                if (d.warnings && d.warnings.length) renderWarnings(d.warnings);
+
+                // Light up final step, then reset after 3 s
+                _litPipelineStep(5);
+                setTimeout(function(){ _litPipelineStep(0); }, 3000);
+
+                if (d.syntax_valid === false) {
+                  showToast("\u26A0 AI done \u2014 syntax warning, check Warnings tab", "warn");
+                } else {
+                  showToast("\u2705 AI conversion complete \u2014 syntax valid!", "success");
+                }
+              } catch(e) {
+                console.error("RESULT parse error", e);
+                out.textContent = "# Parse error in result — see console";
+                showToast("Result parse error: " + e.message, "error");
+              }
+              btn.classList.remove("loading"); btn.disabled = false;
+              return;
+            }
+          });
+          pump();
+        }).catch(function(e) {
+          _stopAIProgress();
+          showToast("Stream error: " + e.message, "error");
+          btn.classList.remove("loading"); btn.disabled = false;
+        });
+      }
+      pump();
+    }).catch(function(e) {
+      _stopAIProgress();
+      out.textContent = "# AI ERROR: " + e.message;
+      showToast("AI request failed: " + e.message, "error");
+      btn.classList.remove("loading"); btn.disabled = false;
+    });
+  }
+
+  function aiExplain() {
+    if (!lastCode) { showToast("Convert SQL first.", "warn"); return; }
+    var btn = document.getElementById("explainBtn");
+    btn.classList.add("loading"); btn.disabled = true;
+ 
+    fetch("/ai-explain", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({code: lastCode})
+    }).then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (d.error) { showToast("AI Error: " + d.error, "error"); }
+      else {
+        lastCode = d.code;
+        document.getElementById("codeOutput").textContent = d.code;
+        showToast("\uD83E\uDD16 AI added comments!", "success");
+      }
+    }).catch(function(e){ showToast("AI request failed: " + e.message, "error"); })
+    .finally(function(){ btn.classList.remove("loading"); btn.disabled = false; });
+  }
+ 
+  function aiOptimize() {
+    if (!lastCode) { showToast("Convert SQL first.", "warn"); return; }
+    var btn = document.getElementById("optimizeBtn");
+    btn.classList.add("loading"); btn.disabled = true;
+ 
+    fetch("/ai-optimize", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({code: lastCode})
+    }).then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (d.error) { showToast("AI Error: " + d.error, "error"); }
+      else {
+        lastCode = d.code;
+        document.getElementById("codeOutput").textContent = d.code;
+        renderQuickView(d.code, getSQL());
+        showToast("\uD83D\uDE80 AI optimization applied!", "success");
+      }
+    }).catch(function(e){ showToast("AI request failed: " + e.message, "error"); })
+    .finally(function(){ btn.classList.remove("loading"); btn.disabled = false; });
+  }
+</script>
+</body>
+</html>

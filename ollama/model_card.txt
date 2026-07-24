@@ -1,0 +1,76 @@
+MODEL CARD — qwen2.5-coder:7b
+==============================
+
+Full Name   : Qwen2.5-Coder-7B-Instruct (Q4_K_M quantized)
+Model ID    : dae161e27b0e
+Developer   : Alibaba Cloud / Qwen Team
+License     : Apache 2.0 (free for commercial use)
+Downloaded  : 2026-07-13
+Local Path  : %USERPROFILE%\.ollama\models\blobs\
+
+TECHNICAL SPECS
+---------------
+Architecture      : Qwen2 (transformer decoder)
+Parameters        : 7.6 billion
+Context Length    : 32,768 tokens (full context)
+Embedding Length  : 3,584
+Quantization      : Q4_K_M  (4-bit, K-means, medium quality)
+  → Full precision would be ~28 GB; Q4_K_M reduces to 4.7 GB
+    with ~1-3% quality loss vs. full precision
+
+Capabilities
+  ✓ Code completion
+  ✓ Tool/function calling
+  ✓ Code insertion / infilling
+
+PERFORMANCE IN THIS PROJECT
+----------------------------
+Conversion speed (CPU only)  : 10–30 tokens/second
+Typical SP conversion time   : 30–90 seconds
+Simple query conversion time : 15–30 seconds
+
+What it does well
+  ✓ SQL → PySpark SQL conversion (spark.sql())
+  ✓ T-SQL stored procedure structure analysis
+  ✓ Cursor pattern replacement with batch operations
+  ✓ Delta Lake API recommendations
+  ✓ Python function signatures from SP parameters
+  ✓ DECLARE variable → Python variable conversion
+  ✓ Temp table → createOrReplaceTempView mapping
+
+DEPLOYMENT
+----------
+Served by   : Ollama 0.31.2
+API endpoint: http://localhost:11434/api/chat
+Request format (JSON):
+  {
+    "model": "qwen2.5-coder:7b",
+    "messages": [
+      { "role": "system", "content": "<7-step pipeline instructions>" },
+      { "role": "user",   "content": "<your SQL here>" }
+    ],
+    "options": { "temperature": 0.2 },
+    "stream": false
+  }
+
+PRIVACY & COMPLIANCE
+---------------------
+Data locality  : All data stays on this machine (localhost only)
+Internet use   : Zero — after model download, no network calls are made
+SQL exposure   : Your SQL never leaves the PC
+Audit trail    : No conversation history stored by Ollama
+
+COST
+-----
+Model download : One-time (already done)
+Per conversion : $0.00
+Monthly cost   : $0.00
+API key needed : None
+
+ALTERNATIVES (if higher quality needed)
+-----------------------------------------
+Model                   Size    Cost    Notes
+qwen2.5-coder:14b       9 GB    $0      Higher quality, needs more RAM
+codellama:34b           19 GB   $0      Best open-source code model (needs GPU)
+GPT-4.1-mini (OpenAI)   Cloud   Paid    Fastest, highest quality
+claude-3-5-haiku        Cloud   Paid    Good balance of speed/quality

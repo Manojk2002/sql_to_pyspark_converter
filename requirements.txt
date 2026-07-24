@@ -1,0 +1,34 @@
+# SQL → PySpark SQL AI Framework — Python dependencies
+# Install: pip install -r requirements.txt
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+flask>=3.0.0
+werkzeug>=3.0.0
+
+# ── SQL parsing & transpilation ───────────────────────────────────────────────
+sqlglot>=23.0.0
+
+# ── AI / LLM integration — choose one or more providers ──────────────────────
+# Provider 1: OpenAI (GPT-4.1-mini — low-cost, paid)
+openai>=1.30.0
+python-dotenv>=1.0.0
+
+# Provider 2: HuggingFace Inference API (free tier)
+# huggingface-hub>=0.23.0
+
+# Provider 3: Google Gemini (free 1M tokens/month)
+# google-generativeai>=0.7.0
+
+# Provider 4: Ollama (local, completely free — no package needed, uses built-in urllib)
+
+# ── Document generation ───────────────────────────────────────────────────────
+python-docx>=1.1.0
+matplotlib>=3.8.0
+numpy>=1.26.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-cov>=5.0.0
+
+# ── Optional: local Spark validation (large install ~500MB) ───────────────────
+# pyspark>=3.5.0
