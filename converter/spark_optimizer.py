@@ -12,10 +12,7 @@ Analyses generated PySpark code and applies Databricks performance optimisations
   7. AQE note           — remind that AQE is on by default in Databricks
 """
 
-from __future__ import annotations
-
 import re
-from typing import Optional
 from converter.sql_analyzer import AnalysisReport
 
 
@@ -59,7 +56,7 @@ class DatabricksOptimizer:
     def optimize(
         self,
         code: str,
-        report: Optional[AnalysisReport] = None,
+        report: AnalysisReport | None = None,
     ) -> tuple[str, list[str]]:
         """
         Optimise generated PySpark code for Databricks.

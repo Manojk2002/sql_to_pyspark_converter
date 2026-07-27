@@ -203,7 +203,7 @@ class PySparkGenerator:
             for line in raw_clean.split("\n"):
                 body_lines.append(f"        {line}")
             body_lines.append('    """)')
-            body_lines.append("    result_df.show()")
+
             body_lines.append("    return result_df")
  
         return sig + "\n" + "\n".join(body_lines)
@@ -358,8 +358,10 @@ class PySparkGenerator:
     def _to_fn_name(sp_name: str) -> str:
         if not sp_name:
             return "run_query"
-        # Remove schema prefix (dbo.usp_... ? usp_...)
+        # Remove schema prefix (dbo.usp_GetSales → usp_GetSales)
         name = sp_name.split(".")[-1]
-        name = re.sub(r"\W+", "_", name).lower()
+        # Convert CamelCase/PascalCase to snake_case
+        name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+        name = re.sub(r"\W+", "_", name).lower().strip("_")
         return name
  

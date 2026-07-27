@@ -12,7 +12,6 @@ from sql_mappings.sql_functions import SCALAR_FUNCTION_MAP
  
 try:
     import sqlglot
-    import sqlglot.expressions as exp
     _HAS_SQLGLOT = True
 except ImportError:
     _HAS_SQLGLOT = False
@@ -75,8 +74,21 @@ def convert_declare(var: DeclaredVariable) -> str:
     return f"{py_name} = {default}  # SQL: DECLARE {var.name} {var.sql_type}"
  
  
+# SQL Server system SET options that have no PySpark equivalent — silently suppressed
+_SUPPRESS_SET_RE = re.compile(
+    r"SET\s+(NOCOUNT|XACT_ABORT|ANSI_NULLS|ANSI_PADDING|ANSI_WARNINGS|"
+    r"QUOTED_IDENTIFIER|NOEXEC|ARITHABORT|CONCAT_NULL_YIELDS_NULL|"
+    r"NUMERIC_ROUNDABORT|IMPLICIT_TRANSACTIONS)\s+(ON|OFF)",
+    re.IGNORECASE,
+)
+
+
 def convert_set_statement(raw_sql: str) -> str:
     """Convert SET @var = expr to Python assignment."""
+    # Suppress SQL Server system SET options — no PySpark equivalent
+    if _SUPPRESS_SET_RE.match(raw_sql.strip()):
+        return ""
+
     m = re.match(r"SET\s+(@[\w]+)\s*=\s*(.+)", raw_sql.strip(), re.IGNORECASE | re.DOTALL)
     if not m:
         return f"# TODO: {raw_sql.strip()}"
@@ -105,6 +117,83 @@ def _translate_expression(expr: str) -> str:
  
  
 # ──────────────────────────────────────────────────────────────────────────────
+#  @Param substitution helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _handle_nullable_filters(sql: str) -> tuple[str, list[str]]:
+    """Detect nullable-param filter patterns and convert to Python conditional variables.
+
+    Handles both T-SQL:  AND (@Region IS NULL OR sr.Region = @Region)
+    and sqlglot output:  AND (${Region} IS NULL OR sr.Region = ${Region})
+
+    Produces:
+      pre: _region_filter = f"AND sr.Region = '{region}'" if region is not None else ""
+      sql: {_region_filter}
+    """
+    pre_lines: list[str] = []
+
+    # Match both @Param and ${Param} forms; use DOTALL since sqlglot adds newlines
+    pattern = re.compile(
+        r"(?:AND\s+)?\(\s*(?:@|\$\{)([\w]+)(?:\})?\s+IS\s+NULL"
+        r"\s+OR\s+([\w\.]+)\s*=\s*(?:@|\$\{)\1(?:\})?\s*\)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _replace(m_):
+        py_name = _clean_name("@" + m_.group(1))
+        col     = m_.group(2)
+        var     = f"_{py_name}_filter"
+        pre_lines.append(
+            f'{var} = f"AND {col} = \'{{{py_name}}}\'" if {py_name} is not None else ""'
+        )
+        return "{" + var + "}"
+
+    modified = pattern.sub(_replace, sql)
+    return modified, pre_lines
+
+
+def _substitute_params(sql: str) -> tuple[str, bool]:
+    """Replace SQL parameter refs with quoted Python f-string placeholders.
+
+    Handles both T-SQL (@Param) and Spark SQL named params (${Param}) produced
+    by sqlglot transpilation.
+    Returns (modified_sql, has_params).
+    """
+    if "@" not in sql and "${" not in sql:
+        return sql, False
+    # Match @Param or ${Param}
+    _param_re = re.compile(r"(?:@([\w]+)|\$\{([\w]+)\})")
+    if not _param_re.search(sql):
+        return sql, False
+
+    def _fmt(m_: re.Match) -> str:
+        name = m_.group(1) or m_.group(2)  # capture from @Param or ${Param}
+        return "'" + "{" + _clean_name("@" + name) + "}" + "'"
+
+    result = _param_re.sub(_fmt, sql)
+    return result, True
+
+
+def _build_spark_sql(sql: str, var: str = "result_df",
+                     view_name: str = "", pre_lines: list[str] | None = None) -> str:
+    """Wrap a SQL string in spark.sql(). Handles f-string, indentation, pre-filter vars."""
+    pre_lines = pre_lines or []
+    sql_clean, has_params = _substitute_params(sql)
+    q = "f" if (has_params or pre_lines) else ""
+
+    output: list[str] = []
+    if pre_lines:
+        output.extend(pre_lines)
+    output.append(f'{var} = spark.sql({q}"""')
+    for line in sql_clean.rstrip(";").split("\n"):
+        output.append(f"    {line}" if line.strip() else "")
+    output.append('""")')
+    if view_name:
+        output.append(f'{var}.createOrReplaceTempView("{view_name}")')
+    return "\n".join(output)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  SELECT statement → PySpark
 # ──────────────────────────────────────────────────────────────────────────────
  
@@ -127,203 +216,35 @@ def convert_select(stmt: SQLStatement, db_prefix: str = "my_db") -> str:
  
 def _convert_select_spark_sql(raw: str, alias: str, db_prefix: str, into_match) -> str:
     """Fallback: wrap in spark.sql(). Remove INTO clause first."""
-    lines: list[str] = []
- 
-    # Remove SELECT ... INTO #temp (not valid in Spark SQL)
     if into_match:
         clean_sql = re.sub(r"\s*INTO\s+#[\w]+", "", raw, flags=re.IGNORECASE).strip()
         view_name = alias.lstrip("#")
-        lines.append(f'# SQL: SELECT ... INTO {alias}')
-        lines.append(f'_{view_name}_df = spark.sql("""')
-        lines.append(f'    {clean_sql.rstrip(";")}')
-        lines.append('""")')
-        lines.append(f'_{view_name}_df.createOrReplaceTempView("{view_name}")')
-    else:
-        lines.append('result_df = spark.sql("""')
-        lines.append(f'    {raw.rstrip(";")}')
-        lines.append('""")')
-        lines.append('result_df.show()')
- 
-    return "\n".join(lines)
- 
- 
+        sql, pre  = _handle_nullable_filters(clean_sql)
+        return _build_spark_sql(sql, var=f"_{view_name}_df",
+                                view_name=view_name, pre_lines=pre)
+    sql, pre = _handle_nullable_filters(raw)
+    return _build_spark_sql(sql, pre_lines=pre)
 def _convert_select_sqlglot(raw: str, alias: str, db_prefix: str, into_match) -> str:
-    """Use sqlglot to parse SELECT and produce DataFrame API code."""
+    """Use sqlglot to transpile T-SQL → Spark SQL dialect, then wrap in spark.sql()."""
     try:
-        # Parse using T-SQL dialect
-        tree = sqlglot.parse_one(raw, dialect="tsql")
+        # pretty=True preserves multi-line formatting; error_level=RAISE falls back on failure
+        transpiled = sqlglot.transpile(raw, read="tsql", write="spark",
+                                       pretty=True, error_level="raise")
+        spark_sql = transpiled[0] if transpiled else raw
     except Exception:
-        return _convert_select_spark_sql(raw, alias, db_prefix, into_match)
- 
-    lines: list[str] = []
-    select_node = tree if isinstance(tree, exp.Select) else tree.find(exp.Select)
- 
-    if select_node is None:
-        return _convert_select_spark_sql(raw, alias, db_prefix, into_match)
- 
-    try:
-        lines.extend(_build_dataframe_chain(select_node, alias, db_prefix))
-    except Exception:
-        return _convert_select_spark_sql(raw, alias, db_prefix, into_match)
- 
-    return "\n".join(lines)
- 
- 
-def _build_dataframe_chain(select_node, alias: str, db_prefix: str) -> list[str]:
-    """Build a chained DataFrame expression from a parsed SELECT node."""
-    lines: list[str] = []
- 
-    # ── FROM tables ───────────────────────────────────────────────────────────
-    from_tables: list[tuple[str, str]] = []   # (table_name, alias)
-    for from_clause in select_node.find_all(exp.From):
-        for tbl in from_clause.find_all(exp.Table):
-            tbl_name  = tbl.name
-            tbl_alias = tbl.alias or tbl_name.lower().replace(".", "_")
-            from_tables.append((tbl_name, tbl_alias))
- 
-    if not from_tables:
-        raise ValueError("No FROM clause found")
- 
-    main_tbl, main_alias = from_tables[0]
-    # Decide whether to broadcast lookup tables (simple heuristic: if name suggests "dim" or "lookup")
-    def is_small(name: str) -> bool:
-        return any(k in name.lower() for k in ("dim", "lookup", "ref", "code", "type", "status"))
- 
-    df_var = f"{_clean_name(main_alias)}_df"
-    lines.append(f"{df_var} = spark.table(\"{db_prefix}.{main_tbl}\")")
- 
-    # ── JOINs ─────────────────────────────────────────────────────────────────
-    for join in select_node.find_all(exp.Join):
-        join_tbl = join.find(exp.Table)
-        if not join_tbl:
-            continue
-        jtbl_name  = join_tbl.name
-        jtbl_alias = join_tbl.alias or jtbl_name.lower()
-        j_var      = f"{_clean_name(jtbl_alias)}_df"
-        join_type  = {
-            "LEFT OUTER": "left", "LEFT": "left",
-            "RIGHT OUTER": "right", "RIGHT": "right",
-            "FULL OUTER": "outer", "FULL": "outer",
-            "CROSS": "cross",
-        }.get(join.kind.upper() if join.kind else "", "inner")
- 
-        if is_small(jtbl_name):
-            lines.append(f"{j_var} = spark.table(\"{db_prefix}.{jtbl_name}\")")
-            lines.append(f"# Small lookup table — using broadcast join")
-            on_clause = join.find(exp.On)
-            cond_str  = on_clause.this.sql(dialect="spark") if on_clause else "\"TODO: join condition\""
-            lines.append(
-                f"{df_var} = {df_var}.join(F.broadcast({j_var}), "
-                f"on={cond_str!r}, how=\"{join_type}\")"
-            )
-        else:
-            lines.append(f"{j_var} = spark.table(\"{db_prefix}.{jtbl_name}\")")
-            on_clause = join.find(exp.On)
-            cond_str  = on_clause.this.sql(dialect="spark") if on_clause else "\"TODO\""
-            lines.append(
-                f"{df_var} = {df_var}.join({j_var}, on={cond_str!r}, how=\"{join_type}\")"
-            )
- 
-    # ── WHERE ─────────────────────────────────────────────────────────────────
-    where = select_node.find(exp.Where)
-    if where:
-        where_sql = where.this.sql(dialect="spark")
-        lines.append(f"{df_var} = {df_var}.filter(\"{where_sql}\")")
- 
-    # ── GROUP BY + aggregations ───────────────────────────────────────────────
-    group_by = select_node.find(exp.Group)
-    if group_by:
-        group_cols = [c.sql(dialect="spark") for c in group_by.expressions]
-        group_str  = ", ".join(f'"{c}"' for c in group_cols)
-        # Build agg list from SELECT columns (those with aggregate functions)
-        agg_exprs  = _extract_agg_expressions(select_node)
-        having     = select_node.find(exp.Having)
- 
-        lines.append(f"{df_var} = (")
-        lines.append(f"    {df_var}")
-        lines.append(f"    .groupBy({group_str})")
-        lines.append(f"    .agg(")
-        for ae in agg_exprs:
-            lines.append(f"        {ae},")
-        lines.append(f"    )")
-        if having:
-            having_sql = having.this.sql(dialect="spark")
-            lines.append(f"    .filter(\"{having_sql}\")")
-        lines.append(f")")
-    else:
-        # Simple SELECT — use .select()
-        select_cols = _extract_select_columns(select_node)
-        if select_cols and select_cols != ["*"]:
-            cols_str = ", ".join(f'"{c}"' for c in select_cols)
-            lines.append(f"{df_var} = {df_var}.select({cols_str})")
- 
-    # ── ORDER BY ──────────────────────────────────────────────────────────────
-    order = select_node.find(exp.Order)
-    if order:
-        order_parts = []
-        for ob in order.find_all(exp.Ordered):
-            col_sql = ob.this.sql(dialect="spark")
-            if ob.args.get("desc"):
-                order_parts.append(f"F.desc(\"{col_sql}\")")
-            else:
-                order_parts.append(f"F.asc(\"{col_sql}\")")
-        if order_parts:
-            lines.append(f"{df_var} = {df_var}.orderBy({', '.join(order_parts)})")
- 
-    # ── LIMIT ─────────────────────────────────────────────────────────────────
-    limit = select_node.find(exp.Limit)
-    if limit:
-        n = limit.this.sql()
-        lines.append(f"{df_var} = {df_var}.limit({n})")
- 
-    # ── INTO temp table or final show ─────────────────────────────────────────
-    if alias:
+        spark_sql = raw  # fall back to original SQL if transpilation fails
+
+    if into_match:
+        clean_sql = re.sub(r"\s*INTO\s+#[\w]+", "", spark_sql, flags=re.IGNORECASE).strip()
         view_name = alias.lstrip("#")
-        lines.append(f'{df_var}.createOrReplaceTempView("{view_name}")')
-        lines.append(f"# ↑ Equivalent to SQL temp table {alias}")
-    else:
-        lines.append(f"{df_var}.show()")
+        sql, pre  = _handle_nullable_filters(clean_sql)
+        return _build_spark_sql(sql, var=f"_{view_name}_df",
+                                view_name=view_name, pre_lines=pre)
+
+    sql, pre = _handle_nullable_filters(spark_sql)
+    return _build_spark_sql(sql, pre_lines=pre)
  
-    return lines
- 
- 
-def _extract_select_columns(select_node) -> list[str]:
-    cols = []
-    for expr in select_node.expressions:
-        if isinstance(expr, exp.Star):
-            return ["*"]
-        cols.append(expr.alias or expr.sql(dialect="spark"))
-    return cols
- 
- 
-def _extract_agg_expressions(select_node) -> list[str]:
-    AGG_FUNCS = {"COUNT", "SUM", "AVG", "MAX", "MIN", "STDEV", "VARIANCE"}
-    aggs = []
-    for expr in select_node.expressions:
-        func = expr.find(exp.Anonymous) or expr.find(exp.Count) or expr.find(exp.Sum) \
-               or expr.find(exp.Avg) or expr.find(exp.Max) or expr.find(exp.Min)
-        if func is not None:
-            alias_name = expr.alias or expr.sql(dialect="spark").replace(" ", "_")
-            fn_sql     = expr.sql(dialect="spark")
-            # Map common aggregates
-            fn_sql_u   = fn_sql.upper()
-            if fn_sql_u.startswith("COUNT("):
-                aggs.append(f"F.count(\"*\").alias(\"{alias_name}\")")
-            elif fn_sql_u.startswith("SUM("):
-                inner = re.search(r"SUM\((.+)\)", fn_sql, re.IGNORECASE)
-                aggs.append(f"F.sum(\"{inner.group(1) if inner else '*'}\").alias(\"{alias_name}\")")
-            elif fn_sql_u.startswith("AVG("):
-                inner = re.search(r"AVG\((.+)\)", fn_sql, re.IGNORECASE)
-                aggs.append(f"F.avg(\"{inner.group(1) if inner else '*'}\").alias(\"{alias_name}\")")
-            elif fn_sql_u.startswith("MAX("):
-                inner = re.search(r"MAX\((.+)\)", fn_sql, re.IGNORECASE)
-                aggs.append(f"F.max(\"{inner.group(1) if inner else '*'}\").alias(\"{alias_name}\")")
-            elif fn_sql_u.startswith("MIN("):
-                inner = re.search(r"MIN\((.+)\)", fn_sql, re.IGNORECASE)
-                aggs.append(f"F.min(\"{inner.group(1) if inner else '*'}\").alias(\"{alias_name}\")")
-            else:
-                aggs.append(f"F.expr(\"{fn_sql}\").alias(\"{alias_name}\")")
-    return aggs
+
  
  
 # ──────────────────────────────────────────────────────────────────────────────
@@ -331,7 +252,7 @@ def _extract_agg_expressions(select_node) -> list[str]:
 # ──────────────────────────────────────────────────────────────────────────────
  
 def convert_insert(stmt: SQLStatement, db_prefix: str = "my_db") -> str:
-    raw   = stmt.raw_sql.strip()
+    raw = stmt.raw_sql.strip()
     # INSERT INTO table SELECT ...
     m = re.match(
         r"INSERT\s+(?:INTO\s+)?([#\w\.]+)(?:\s*\([^)]*\))?\s*(SELECT.+)",
@@ -339,29 +260,45 @@ def convert_insert(stmt: SQLStatement, db_prefix: str = "my_db") -> str:
     )
     if m:
         target   = m.group(1).strip()
-        sel_part = m.group(2).strip()
+        sel_part = m.group(2).strip().rstrip(";")
+
+        # Pretty-print the SELECT using sqlglot for consistent indentation
+        if _HAS_SQLGLOT:
+            try:
+                transpiled = sqlglot.transpile(sel_part, read="tsql", write="spark",
+                                               pretty=True, error_level="raise")
+                sel_part = transpiled[0] if transpiled else sel_part
+            except Exception:
+                pass  # keep original if transpilation fails
+
+        sel_sql, pre = _handle_nullable_filters(sel_part)
+
         if target.startswith("#"):
             view_name = target.lstrip("#")
-            return (
-                f"# INSERT INTO {target} SELECT ...\n"
-                f'_insert_df = spark.sql("""\n    {sel_part.rstrip(";")}\n""")\n'
-                f'_insert_df.createOrReplaceTempView("{view_name}")'
-            )
+            var_name  = _clean_name(view_name) + "_df"
+            return _build_spark_sql(sel_sql, var=var_name,
+                                    view_name=view_name, pre_lines=pre)
         else:
+            sel_clean, has_params = _substitute_params(sel_sql)
+            q = "f" if (has_params or pre) else ""
+            pre_block = "\n".join(pre) + "\n" if pre else ""
             return (
                 f"# INSERT INTO {target}\n"
-                f'_insert_df = spark.sql("""\n    {sel_part.rstrip(";")}\n""")\n'
+                f"{pre_block}"
+                f'_insert_df = spark.sql({q}"""\n    {sel_clean}\n""")\n'
                 f'_insert_df.write.format("delta").mode("append").saveAsTable("{db_prefix}.{target}")'
             )
- 
+
     # INSERT INTO table VALUES (...)
+    raw_clean, has_params = _substitute_params(raw.rstrip(";"))
+    q = "f" if has_params else ""
     return (
         f"# INSERT with VALUES\n"
         f"# NOTE: For bulk inserts prefer reading from a DataFrame.\n"
-        f'spark.sql("""\n    {raw.rstrip(";")}\n""")'
+        f'spark.sql({q}"""\n    {raw_clean}\n""")'
     )
- 
- 
+
+
 def convert_update(stmt: SQLStatement, db_prefix: str = "my_db") -> str:
     raw = stmt.raw_sql.strip()
     m   = re.match(
@@ -828,14 +765,10 @@ def _cursor_foreach_fallback(info: _CursorInfo) -> list[str]:
  
 def convert_create_temp(stmt: SQLStatement) -> str:
     raw = stmt.raw_sql.strip()
-    m   = re.search(r"CREATE\s+TABLE\s+(#[\w]+)\s*\(([^)]+)\)", raw, re.IGNORECASE | re.DOTALL)
+    m   = re.search(r"CREATE\s+TABLE\s+(#[\w]+)", raw, re.IGNORECASE)
     if m:
         name = m.group(1).lstrip("#")
-        return (
-            f"# CREATE TABLE {m.group(1)} → Temp view created when data is first inserted\n"
-            f"# Spark temp views are session-scoped and don't require pre-definition.\n"
-            f"# The view '{name}' will be created with: df.createOrReplaceTempView(\"{name}\")"
-        )
+        return f'# NOTE: {m.group(1)} → Spark temp view "{name}" (created by createOrReplaceTempView below)'
     return f"# CREATE TABLE (temp): {raw[:80]}..."
  
  
@@ -844,10 +777,7 @@ def convert_drop_temp(stmt: SQLStatement) -> str:
     m   = re.search(r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(#[\w]+)", raw, re.IGNORECASE)
     if m:
         name = m.group(1).lstrip("#")
-        return (
-            f"# DROP TABLE {m.group(1)} → Temp views are auto-cleaned at session end.\n"
-            f'spark.catalog.dropTempView("{name}")  # Optional explicit cleanup'
-        )
+        return f'spark.catalog.dropTempView("{name}")'
     return f"# DROP TABLE: {raw[:80]}..."
  
  
@@ -893,7 +823,6 @@ def convert_unknown(stmt: SQLStatement) -> str:
         for line in transpiled.split("\n"):
             lines.append(f"    {line}")
         lines.append('""")')
-        lines.append("result_df.show()")
     else:
         # ── Raw passthrough — wrap as-is ──────────────────────────────────────
         lines = [

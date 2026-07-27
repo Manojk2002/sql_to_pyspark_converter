@@ -1,44 +1,47 @@
 """
-Flask Web Application � SQL to PySpark AI Converter
+Flask Web Application - SQL to PySpark AI Converter
 Run: python app.py
 Open: http://localhost:5000
-7-Step AI Framework Pipeline: Analyse ? Map ? Rewrite ? Procedural ? Transactions ? Optimise ? Validate
 """
- 
+
 import os
 import sys
 import json
 import pathlib
- 
+import traceback
+
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from werkzeug.utils import secure_filename
- 
-# -- Ensure project root is on sys.path ---------------------------------------
+
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
- 
-from converter.sql_parser    import SQLParser
-from converter.sql_analyzer  import SQLAnalyzer
+
+from converter.sql_parser import SQLParser
+from converter.sql_analyzer import SQLAnalyzer
 from converter.code_generator import PySparkGenerator
-from ai_provider.ai_provider  import (
-    convert_sql_with_ai, stream_sql_with_ai,
-    explain_pyspark_code, optimize_pyspark_code,
-    is_available as ai_available, get_provider_info,
+from converter.sql_preprocessor import preprocess
+from converter.code_postprocessor import postprocess
+from ai_provider.ai_provider import (
+    convert_sql_with_ai,
+    is_available as ai_available,
+    get_provider_info,
+    explain_pyspark_code,
+    optimize_pyspark_code,
 )
- 
+
 app = Flask(__name__, template_folder="web_ui/templates")
-app.config["JSON_SORT_KEYS"]   = False
-app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024   # 5 MB upload limit
- 
+app.config["JSON_SORT_KEYS"] = False
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5 MB upload limit
+
 ALLOWED_EXTENSIONS = {".sql", ".txt"}
- 
+
 SAMPLES_DIR = pathlib.Path(__file__).parent / "samples"
-OUTPUT_DIR  = pathlib.Path(__file__).parent / "output"
+OUTPUT_DIR = pathlib.Path(__file__).parent / "output"
 UPLOADS_DIR = pathlib.Path(__file__).parent / "uploads"
 OUTPUT_DIR.mkdir(exist_ok=True)
 UPLOADS_DIR.mkdir(exist_ok=True)
- 
-_parser    = SQLParser()
-_analyzer  = SQLAnalyzer()
+
+_parser = SQLParser()
+_analyzer = SQLAnalyzer()
  
 # Quick-reference mapping for the UI
 QUICK_REF = [
@@ -65,12 +68,13 @@ QUICK_REF = [
 ]
  
  
-# -- Routes --------------------------------------------------------------------
- 
+# --- Routes ------------------------------------------------------------------
+
 def _extract_quick_view(code: str, sql_input: str) -> str:
-    """
-    Extract just the converted logic (function body) from the full generated file.
-    Returns clean, dedented PySpark code the user cares about immediately.
+    """Extract just the converted logic from the full generated file.
+
+    Strips the file header, imports, and validation scaffold so the user
+    sees only the PySpark SQL statements they care about.
     """
     lines = code.split("\n")
  
@@ -88,7 +92,7 @@ def _extract_quick_view(code: str, sql_input: str) -> str:
         val_idx -= 1
  
     if main_idx is None:
-        # No marker � try to find first _df or spark. line
+        # No marker - try to find first spark.sql() line
         main_idx = next(
             (i for i, l in enumerate(lines) if "_df = spark" in l or "result_df = spark" in l),
             None,
@@ -115,13 +119,12 @@ def _extract_quick_view(code: str, sql_input: str) -> str:
         dedented.pop()
  
     if not dedented:
-        # Truly empty body � return a passthrough
         clean = sql_input.strip().rstrip(";")
         return (
-            '# Could not parse SQL � using spark.sql() passthrough\n'
+            '# Could not parse SQL - using spark.sql() passthrough\n'
             'result_df = spark.sql("""\n'
             + "\n".join(f"    {l}" for l in clean.split("\n"))
-            + '\n""")\nresult_df.show()'
+            + '\n""")'
         )
  
     return "\n".join(dedented)
@@ -142,23 +145,22 @@ def index():
  
 @app.route("/convert", methods=["POST"])
 def convert():
-    data      = request.get_json(force=True)
-    sql_text  = (data.get("sql") or "").strip()
- 
+    data = request.get_json(force=True)
+    sql_text = (data.get("sql") or "").strip()
+
     if not sql_text:
         return jsonify({"error": "No SQL provided"}), 400
- 
+
     try:
-        parsed   = _parser.parse(sql_text)
-        report   = _analyzer.analyze(parsed)
-        gen      = PySparkGenerator()
-        code     = gen.generate(parsed, report)
- 
-        # Save to output/
+        parsed = _parser.parse(sql_text)
+        report = _analyzer.analyze(parsed)
+        gen = PySparkGenerator()
+        code = gen.generate(parsed, report)
+
         safe_name = (parsed.sp_name or "query").replace(".", "_").replace("[", "").replace("]", "")
-        out_file  = OUTPUT_DIR / f"{safe_name}_pyspark.py"
+        out_file = OUTPUT_DIR / f"{safe_name}_pyspark.py"
         out_file.write_text(code, encoding="utf-8")
- 
+
         analysis = {
             "sp_name":          parsed.sp_name,
             "is_sp":            parsed.is_stored_procedure,
@@ -174,9 +176,9 @@ def convert():
             "has_window":       report.has_window_functions,
             "dependencies":     report.dependencies,
         }
- 
+
         quick_code = _extract_quick_view(code, sql_text)
- 
+
         return jsonify({
             "code":       code,
             "quick_code": quick_code,
@@ -184,9 +186,8 @@ def convert():
             "analysis":   analysis,
             "warnings":   report.conversion_warnings,
         })
- 
+
     except Exception as exc:
-        import traceback
         return jsonify({"error": str(exc), "trace": traceback.format_exc()}), 500
  
  
@@ -241,8 +242,8 @@ def _check_sqlglot() -> bool:
         return False
  
  
-# -- AI endpoints -------------------------------------------------------------
- 
+# --- AI endpoints ------------------------------------------------------------
+
 @app.route("/ai-status")
 def ai_status():
     """Return the active AI provider, model, and availability status."""
@@ -312,14 +313,13 @@ def ai_convert():
 
 @app.route("/ai-convert-stream", methods=["POST"])
 def ai_convert_stream():
+    """SSE endpoint - runs the full 3-stage pipeline and pushes one [RESULT] event.
+
+    Progress is reported via lightweight [STEP] events before the final result.
     """
-    SSE endpoint � runs the full 3-stage pipeline and pushes one clean [RESULT] event.
-    No raw tokens are streamed; this eliminates all display artifacts in any JS version.
-    Progress steps are sent as lightweight [STEP] events so old/new JS can show feedback.
-    """
-    data      = request.get_json(force=True)
-    sql_text  = (data.get("sql") or "").strip()
-    dialect   = (data.get("dialect") or "T-SQL").strip()
+    data = request.get_json(force=True)
+    sql_text = (data.get("sql") or "").strip()
+    dialect = (data.get("dialect") or "T-SQL").strip()
 
     if not sql_text:
         return jsonify({"error": "No SQL provided"}), 400
@@ -329,40 +329,34 @@ def ai_convert_stream():
         return jsonify({"error": f"AI provider '{info['provider']}' not reachable."}), 503
 
     def generate():
-        import json as _json
         try:
-            # -- Stage 1: Preprocess ------------------------------------------
             yield "data: [STEP] Analysing SQL structure (Stage 1/3)\n\n"
-            from converter.sql_preprocessor import preprocess
             pre = preprocess(sql_text)
 
-            # -- Stage 2: LLM -------------------------------------------------
-            yield "data: [STEP] Sending to Ollama AI (Stage 2/3 - please wait)\n\n"
+            yield "data: [STEP] Sending to AI (Stage 2/3 - please wait)\n\n"
             code = convert_sql_with_ai(sql_text, db_prefix="", dialect=dialect)
 
-            # -- Stage 3: Postprocess -----------------------------------------
             yield "data: [STEP] Validating and cleaning output (Stage 3/3)\n\n"
-            from converter.code_postprocessor import postprocess
             post = postprocess(code)
-            code = post.code
 
             safe_name = pre.sp_name.replace(".", "_").replace(" ", "_") or "ai_query"
-            out_file  = OUTPUT_DIR / f"{safe_name}_pyspark.py"
-            out_file.write_text(code, encoding="utf-8")
+            out_file = OUTPUT_DIR / f"{safe_name}_pyspark.py"
+            out_file.write_text(post.code, encoding="utf-8")
 
-            # Single compact [RESULT] event � ensure_ascii keeps it on one line
-            result_payload = _json.dumps(
-                {"code": code, "sp_name": safe_name,
-                 "syntax_valid": post.syntax_valid,
-                 "warnings": post.warnings},
+            result_payload = json.dumps(
+                {
+                    "code":         post.code,
+                    "sp_name":      safe_name,
+                    "syntax_valid": post.syntax_valid,
+                    "warnings":     post.warnings,
+                },
                 ensure_ascii=True,
             )
             yield f"data: [RESULT] {result_payload}\n\n"
             yield "data: [DONE]\n\n"
 
         except Exception as exc:
-            import traceback as _tb
-            yield f"data: [ERROR] {_json.dumps(str(exc))}\n\n"
+            yield f"data: [ERROR] {json.dumps(str(exc))}\n\n"
 
     return Response(
         stream_with_context(generate()),
@@ -407,18 +401,15 @@ def ai_optimize():
         return jsonify({"error": str(exc)}), 500
  
  
-# -- Entry point ---------------------------------------------------------------
+# --- Entry point --------------------------------------------------------------
 
 if __name__ == "__main__":
     print("\n" + "=" * 60)
-    print("  SQL ? PySpark AI Converter � Web UI")
+    print("  SQL -> PySpark AI Converter - Web UI")
     print("  Open: http://localhost:5000")
     print("  Press Ctrl+C to stop")
     print("=" * 60 + "\n")
-    # Exclude output/ and uploads/ from the reloader so saving generated .py
-    # files does not trigger a full server restart.
-    import os as _os
-    _os.environ.setdefault("WERKZEUG_RELOADER_EXTRA_FILES", "")
+    os.environ.setdefault("WERKZEUG_RELOADER_EXTRA_FILES", "")
     app.run(
         debug=True,
         host="0.0.0.0",

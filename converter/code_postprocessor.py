@@ -225,6 +225,19 @@ def _check_return(code: str, warnings: list[str]) -> None:
     except SyntaxError:
         pass  # handled separately by syntax check
 
+# ─── Unused logging remover ───────────────────────────────────────────────────────────
+
+_LOGGING_LINE_RE = re.compile(
+    r"^(?:import logging|logging\.basicConfig[^\n]*|logger\s*=\s*logging\.getLogger[^\n]*)\n?",
+    re.MULTILINE,
+)
+
+
+def _strip_unused_logging(code: str) -> str:
+    """Remove logging imports and logger setup if logger is never actually called."""
+    if re.search(r"\blogger\.(info|warning|error|debug|exception)\s*\(", code):
+        return code  # logger is used — keep it
+    return _LOGGING_LINE_RE.sub("", code)
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -279,7 +292,10 @@ def postprocess(raw_output: str) -> PostprocessResult:
     # Step 3: Inject missing imports
     code = _inject_imports(code, warnings, injected)
 
-    # Step 3b: If cursor patterns are present, inject reference note
+    # Step 3b: Strip unused logging imports
+    code = _strip_unused_logging(code)
+
+    # Step 3c: If cursor patterns are present, inject reference note
     code = _inject_cursor_note(code)
 
     # Step 4: Validate Python syntax

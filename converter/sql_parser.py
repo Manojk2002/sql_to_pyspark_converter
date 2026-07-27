@@ -1,9 +1,8 @@
 """
-SQL Parser — extracts structured information from SQL Stored Procedures and queries.
-Handles T-SQL (SQL Server), PL/pgSQL (PostgreSQL), and ANSI SQL.
+SQL Parser - extracts structured information from SQL Stored Procedures and queries.
+Handles T-SQL (SQL Server) and Standard SQL (ANSI).
 """
-# saved
- 
+
 import re
 from dataclasses import dataclass, field
 from typing import Optional

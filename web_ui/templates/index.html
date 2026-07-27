@@ -154,7 +154,6 @@
 <header>
   <div>
     <h1>&#9889; SQL &rarr; PySpark <span style="color:#93C5FD;">AI</span> Converter</h1>
-    <span class="sub">Rule-Based + AI Pipeline &mdash; T-SQL, ANSI SQL, Stored Procedures &rarr; Production PySpark SQL</span>
   </div>
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
     <span id="providerBadge" style="background:rgba(124,58,237,.3);color:#C4B5FD;border:1px solid rgba(196,181,253,.3);padding:4px 11px;border-radius:20px;font-size:.74rem;font-weight:700;letter-spacing:.3px;">&#129302; AI</span>
@@ -190,12 +189,9 @@
     </select>
     <div style="width:1px;height:24px;background:#CBD5E1;margin:0 2px;"></div>
     <label style="margin:0;">SQL Type:</label>
-    <select id="dialect" style="width:auto;min-width:140px;">
-      <option value="tsql">🪟 SQL Server (T-SQL)</option>
-      <option value="ansi">📋 Standard SQL (ANSI)</option>
-      <option value="mysql">🐬 MySQL</option>
-      <option value="postgres">🐘 PostgreSQL</option>
-      <option value="oracle">🔶 Oracle (PL/SQL)</option>
+    <select id="dialect" style="width:auto;min-width:175px;">
+      <option value="tsql" selected>&#129695; SQL Server (T-SQL)</option>
+      <option value="ansi">&#128203; Standard SQL (ANSI)</option>
     </select>
   </div>
  
@@ -220,14 +216,14 @@
         <!-- paste -->
         <div id="pasteMode">
           <textarea id="sqlInput" rows="20"
-            placeholder="-- Paste T-SQL / ANSI SQL here, or load a sample above.
+            placeholder="-- Paste a SQL Stored Procedure or SQL Query here, or load a sample above.
 -- Ctrl+Enter to convert  |  toggle Live Mode for auto-convert.
- 
--- Example:
-SELECT dept, COUNT(*) AS emp_count
-FROM employees
-WHERE salary > 50000
-GROUP BY dept
+
+-- Stored procedure example:
+CREATE PROCEDURE usp_GetSales @StartDate DATE, @EndDate DATE
+AS BEGIN
+  SELECT * FROM Orders WHERE OrderDate BETWEEN @StartDate AND @EndDate
+END
 ORDER BY emp_count DESC;"></textarea>
           <div class="input-meta">
             <span id="charCount">0 characters</span>

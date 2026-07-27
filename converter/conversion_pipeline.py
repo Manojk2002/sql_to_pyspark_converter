@@ -24,9 +24,8 @@ from __future__ import annotations
 import textwrap
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Optional
 
-from converter.sql_parser   import SQLParser, ParsedSQL
+from converter.sql_parser import SQLParser, ParsedSQL
 from converter.sql_analyzer import SQLAnalyzer, AnalysisReport
 from converter.code_generator import PySparkGenerator
 from converter.spark_optimizer import DatabricksOptimizer
@@ -44,9 +43,9 @@ class PipelineResult:
     sql_input:      str = ""
     db_prefix:      str = "my_db"
 
-    # Step 1 — Analysis
-    parsed:         Optional[ParsedSQL]       = None
-    report:         Optional[AnalysisReport]  = None
+    # Step 1 - Analysis
+    parsed: ParsedSQL | None = None
+    report: AnalysisReport | None = None
 
     # Step 2 — Object mapping (human-readable table)
     object_mapping: list[tuple[str, str, str]] = field(default_factory=list)

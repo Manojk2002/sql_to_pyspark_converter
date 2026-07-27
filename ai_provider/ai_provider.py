@@ -28,6 +28,9 @@ Environment variables:
 """
 
 import os
+import re
+import sys
+import pathlib
 import textwrap
 import json
 import urllib.request
@@ -47,7 +50,7 @@ _ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022")
 _OAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 _OAI_BASE_URL    = os.getenv("OPENAI_BASE_URL")
 _HF_MODEL        = os.getenv("HF_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
-_GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+_GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 _OLLAMA_URL      = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 _OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "codellama")
 
@@ -105,7 +108,7 @@ def is_available() -> bool:
         if not os.getenv("GOOGLE_API_KEY"):
             return False
         try:
-            import google.generativeai  # noqa: F401
+            import google.genai  # noqa: F401
             return True
         except ImportError:
             return False
@@ -142,14 +145,12 @@ def _clean_ai_output(text: str) -> str:
     """Extract only the Python code from AI output.
 
     Models often wrap code in markdown fences and append prose explanations
-    (### Explanation: ...) despite being told not to.  This function:
+    despite being told not to. This function:
       1. Finds the FIRST ```python / ``` / ~~~ fence block and returns its content.
       2. If no fence is found, strips any trailing prose that starts with a
          markdown heading (##, ###) or a numbered list that follows a blank line.
       3. Removes any stray opening/closing fence lines that survived.
     """
-    import re
-
     text = text.strip()
 
     # ── Strategy 1: extract content of the FIRST code fence ──────────────────
@@ -269,15 +270,14 @@ def _chat_gemini(system_prompt: str, user_prompt: str, temperature: float) -> st
         raise RuntimeError("GOOGLE_API_KEY is not set. Get a free key at aistudio.google.com")
 
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name=_GEMINI_MODEL,
-            system_instruction=system_prompt,
-        )
-        response = model.generate_content(
-            user_prompt,
-            generation_config=genai.types.GenerationConfig(
+        from google import genai
+        from google.genai import types as genai_types
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=_GEMINI_MODEL,
+            contents=user_prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
                 temperature=temperature,
                 max_output_tokens=4096,
             ),
@@ -440,30 +440,53 @@ def _chat(system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str
 # ── System prompts ────────────────────────────────────────────────────────────
 
 _CONVERT_SYSTEM = textwrap.dedent("""\
-    You are a SQL-to-PySpark converter. Output ONLY valid Python code — no markdown, no explanations.
+    You are an expert SQL-to-PySpark SQL converter. Output ONLY valid Python code. No markdown fences, no explanations.
 
-    RULES:
-    1. First line must be an import or docstring. No backticks or fences.
-    2. Use spark.sql("...") for ALL SQL (SELECT, INSERT, UPDATE, DELETE, MERGE, CTEs).
-    3. Temp tables (#t) → spark.sql("CREATE OR REPLACE TEMP VIEW t AS SELECT ...")
-    4. SP params → typed Python args. IF/ELSE → Python if/else with spark.sql() inside.
-    5. CURSORS → bulk equivalent (never .collect() + loop):
-       UPDATE cursor → spark.sql("UPDATE db.t SET … WHERE …")
-       INSERT cursor → spark.sql("INSERT INTO db.t SELECT …")
-       DELETE cursor → spark.sql("DELETE FROM db.t WHERE …")
-       Complex cursor → df.foreachPartition(…)  # last resort
-       Add: # NOTE: SQL cursor replaced with bulk Spark operation
-    6. Transactions → Delta ACID (add # NOTE: BEGIN/COMMIT removed).
-    7. Wrap in: def <name>(spark: SparkSession, <params>) -> DataFrame:
-    8. End with: print("Row count:", result_df.count()); result_df.show(10, truncate=False)
-    9. Return result_df.
+    CORE RULES — apply to EVERY conversion:
+    1. First line must be an import or docstring. Never output backticks or code fences.
+    2. Use spark.sql("...") for ALL SQL statements — SELECT, INSERT, UPDATE, DELETE, MERGE, CTEs, DDL.
+       Never use DataFrame API chains (.join(), .filter(), .groupBy(), .select()).
+    3. Temp tables: #t → spark.sql("CREATE OR REPLACE TEMP VIEW t AS SELECT ...")
+    4. Stored procedure params → typed Python function args (e.g. emp_id: int = None).
+    5. IF/ELSE control flow → Python if/elif/else blocks with spark.sql() calls inside.
+    6. WHILE loops → Python while loops with spark.sql() inside; never loop over .collect().
+    7. CURSORS → replace with a single bulk spark.sql() operation:
+         Row-by-row UPDATE → spark.sql("UPDATE db.t SET col=val WHERE cond")
+         Row-by-row INSERT → spark.sql("INSERT INTO db.t SELECT ... FROM ...")
+         Row-by-row DELETE → spark.sql("DELETE FROM db.t WHERE cond")
+         Complex cursor → spark.sql(...).foreachPartition(fn)  # only as last resort
+         Always add: # NOTE: SQL cursor replaced with bulk Spark SQL operation
+    8. Transactions (BEGIN/COMMIT/ROLLBACK) → remove; add # NOTE: Transaction replaced by Delta ACID.
+    9. Function naming:
+        - Stored procedure (CREATE PROCEDURE usp_X) → keep the SP name: def usp_x(spark, ...)
+        - Plain SQL query (SELECT/INSERT/etc., no CREATE PROCEDURE) → descriptive name
+          WITHOUT usp_/sp_ prefix: def get_employees(spark) NOT def usp_get_employees(spark)
+    10. Wrap all logic in: def <name>(spark: SparkSession, <params>) -> DataFrame:
+    11. Do NOT add .show() inside the function body. Production code never displays data.
+    12. Return result_df (last meaningful DataFrame).
+    13. Only import logging and define logger if you actually call logger.info()/logger.warning().
+        For simple queries with no logging calls, omit logging entirely.
 
-    EXAMPLE input:  SELECT emp_id, name FROM employees WHERE dept_id = 10
-    EXAMPLE output:
+    PLAIN QUERY EXAMPLE:
+    Input:  SELECT emp_id, name FROM employees WHERE dept_id = 10
+    Output:
         from pyspark.sql import SparkSession, DataFrame
-        def run_query(spark: SparkSession) -> DataFrame:
-            result_df = spark.sql("SELECT emp_id, name FROM my_db.employees WHERE dept_id = 10")
-            print("Row count:", result_df.count()); result_df.show(10, truncate=False)
+        def get_employees(spark: SparkSession) -> DataFrame:
+            result_df = spark.sql("SELECT emp_id, name FROM employees WHERE dept_id = 10")
+            return result_df
+
+    STORED PROCEDURE EXAMPLE:
+        from pyspark.sql import SparkSession, DataFrame
+        import logging
+        logger = logging.getLogger(__name__)
+
+        def usp_example(spark: SparkSession, dept_id: int = None) -> DataFrame:
+            spark.sql("CREATE OR REPLACE TEMP VIEW active_emps AS SELECT emp_id, name FROM emp WHERE active = 1")
+            if dept_id is not None:
+                result_df = spark.sql(f"SELECT * FROM active_emps WHERE dept_id = {dept_id}")
+            else:
+                result_df = spark.sql("SELECT * FROM active_emps")
+            logger.info("Query complete")
             return result_df
 
     Output ONLY the Python code — nothing else.
@@ -567,10 +590,9 @@ def convert_sql_with_ai(
     Raises:
         RuntimeError: if no AI provider is configured or the API call fails.
     """
-    import sys, pathlib
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
-    # ── Stage 1: Preprocess ──────────────────────────────────────────────────
+    # Stage 1: Preprocess
     from converter.sql_preprocessor import preprocess
     pre = preprocess(sql)
 
