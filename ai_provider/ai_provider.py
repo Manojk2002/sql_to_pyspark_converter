@@ -421,7 +421,7 @@ def _chat_ollama(system_prompt: str, user_prompt: str, temperature: float) -> st
             {"role": "user",   "content": user_prompt},
         ],
         "options": {
-            "temperature":    0.0,    # greedy decoding: fastest + most accurate for code
+            "temperature":    0.1,    # slight randomness prevents copying example patterns
             "seed":           42,     # reproducible output — no re-sampling variance
             "top_k":          20,
             "top_p":          0.9,
@@ -473,7 +473,7 @@ def _stream_ollama(system_prompt: str, user_prompt: str, temperature: float):
             {"role": "user",   "content": user_prompt},
         ],
         "options": {
-            "temperature":    0.0,
+            "temperature":    0.1,
             "seed":           42,
             "top_k":          20,
             "top_p":          0.9,
@@ -566,74 +566,66 @@ _CONVERT_SYSTEM = textwrap.dedent("""\
     You are an expert SQL-to-PySpark SQL converter. Output ONLY valid Python code. No markdown fences, no explanations.
 
     CORE RULES — apply to EVERY conversion:
-    1. First line must be an import or docstring. Never output backticks or code fences.
+    1. First line must be an import or a function definition. Never output backticks or code fences.
     2. Use spark.sql("...") for ALL SQL statements — SELECT, INSERT, UPDATE, DELETE, MERGE, CTEs, DDL.
        Never use DataFrame API chains (.join(), .filter(), .groupBy(), .select()).
-    3. Temp tables: #t → spark.sql("CREATE OR REPLACE TEMP VIEW t AS SELECT ...")
-    4. Stored procedure params → typed Python function args (e.g. emp_id: int = None).
+    3. Temp tables: #tempname → spark.sql("CREATE OR REPLACE TEMP VIEW tempname AS SELECT ...")
+    4. Stored procedure params → typed Python function args (e.g. customer_id: int = None).
     5. IF/ELSE control flow → Python if/elif/else blocks with spark.sql() calls inside.
     6. WHILE loops → Python while loops with spark.sql() inside; never loop over .collect().
-    7. CURSORS → replace with a single bulk spark.sql() operation:
-         Row-by-row UPDATE → spark.sql("UPDATE db.t SET col=val WHERE cond")
-         Row-by-row INSERT → spark.sql("INSERT INTO db.t SELECT ... FROM ...")
-         Row-by-row DELETE → spark.sql("DELETE FROM db.t WHERE cond")
-         Complex cursor → spark.sql(...).foreachPartition(fn)  # only as last resort
-         Always add: # NOTE: SQL cursor replaced with bulk Spark SQL operation
+    7. CURSORS → replace with a single bulk spark.sql() operation (UPDATE/INSERT/DELETE).
+       Always add: # NOTE: SQL cursor replaced with bulk Spark SQL operation
     8. Transactions (BEGIN/COMMIT/ROLLBACK) → remove; add # NOTE: Transaction replaced by Delta ACID.
     9. Function naming:
-        - Stored procedure (CREATE PROCEDURE usp_X) → keep the SP name: def usp_x(spark, ...)
-        - Plain SQL query (SELECT/INSERT/etc., no CREATE PROCEDURE) → descriptive name
-          WITHOUT usp_/sp_ prefix: def get_employees(spark) NOT def usp_get_employees(spark)
+        - Stored procedure: keep the SP name as snake_case: def usp_my_proc(spark, ...)
+        - Plain SQL query: descriptive name WITHOUT usp_/sp_ prefix: def get_orders(spark)
     10. Wrap all logic in: def <name>(spark: SparkSession, <params>) -> DataFrame:
-    11. Do NOT add .show() inside the function body. Production code never displays data.
-    12. Return result_df (last meaningful DataFrame).
+    11. Do NOT add .show() inside the function. Production code never displays data.
+    12. Return the last meaningful DataFrame as result_df.
     13. Only import logging and define logger if you actually call logger.info()/logger.warning().
-        For simple queries with no logging calls, omit logging entirely.
+    14. DYNAMIC SQL (EXEC sp_executesql / EXEC @sql) → build with Python f-string, call spark.sql(f"...")
+    15. FOR JSON PATH → use result_df.toPandas().to_json(orient='records') or spark.sql() with to_json()
+    16. OBJECT_NAME(@@PROCID) → use the literal function name string
+    17. SCOPE_IDENTITY() → omit or use spark.sql("SELECT max(id) FROM ...").first()[0]
+    18. TRY/CATCH → Python try/except; re-raise with raise
+    19. THROW → raise ValueError("message")
+    20. SYSDATETIME() / GETDATE() → use Python: from datetime import datetime; datetime.now()
 
-    PLAIN QUERY EXAMPLE:
-    Input:  SELECT emp_id, name FROM employees WHERE dept_id = 10
+    REQUIRED OUTPUT STRUCTURE:
+      from pyspark.sql import SparkSession, DataFrame
+      # (only add logging import if logger is actually used)
+
+      def <function_name>(spark: SparkSession, <typed_params>) -> DataFrame:
+          # --- convert ALL SQL operations here using spark.sql("...") ---
+          # --- convert ALL temp tables to TEMP VIEW ---
+          # --- convert ALL control flow to Python if/while ---
+          return result_df
+
+    PLAIN QUERY EXAMPLE (for reference only — do NOT copy for stored procedures):
+    Input:  SELECT order_id, total FROM orders WHERE region = 'APAC'
     Output:
-        from pyspark.sql import SparkSession, DataFrame
-        def get_employees(spark: SparkSession) -> DataFrame:
-            result_df = spark.sql("SELECT emp_id, name FROM employees WHERE dept_id = 10")
-            return result_df
+      from pyspark.sql import SparkSession, DataFrame
+      def get_apac_orders(spark: SparkSession) -> DataFrame:
+          result_df = spark.sql("SELECT order_id, total FROM orders WHERE region = 'APAC'")
+          return result_df
 
-    STORED PROCEDURE EXAMPLE:
-        from pyspark.sql import SparkSession, DataFrame
-        import logging
-        logger = logging.getLogger(__name__)
+    T-SQL → SPARK SQL FUNCTION TRANSLATIONS (apply inside every spark.sql("...") string):
+      ISNULL(x, y)              → COALESCE(x, y)
+      LEN(col)                  → LENGTH(col)
+      GETDATE()                 → CURRENT_TIMESTAMP()
+      GETUTCDATE()              → UTC_TIMESTAMP()
+      CHARINDEX(sub, str)       → LOCATE(sub, str)
+      CONVERT(type, col)        → CAST(col AS type)
+      DATEDIFF(unit, start, end)→ DATEDIFF(end, start)   ← ARGS REVERSED in Spark!
+      TOP n                     → LIMIT n  (move to end of SELECT)
+      WITH (NOLOCK)             → remove entirely
+      STRING_AGG(col, delim)    → CONCAT_WS(delim, COLLECT_LIST(col))
+      RAISERROR(msg, …)         → raise ValueError(msg)
+      MERGE INTO (T-SQL syntax) → keep as-is — Spark SQL 3.0+ supports MERGE INTO
+      PIVOT / UNPIVOT           → SUM(CASE WHEN col='v' THEN val_col END) AS alias
+      OFFSET x ROWS FETCH NEXT y ROWS ONLY → LIMIT y OFFSET x
 
-        def usp_example(spark: SparkSession, dept_id: int = None) -> DataFrame:
-            spark.sql("CREATE OR REPLACE TEMP VIEW active_emps AS SELECT emp_id, name FROM emp WHERE active = 1")
-            if dept_id is not None:
-                result_df = spark.sql(f"SELECT * FROM active_emps WHERE dept_id = {dept_id}")
-            else:
-                result_df = spark.sql("SELECT * FROM active_emps")
-            logger.info("Query complete")
-            return result_df
-
-    Output ONLY the Python code — nothing else.
-
-T-SQL → SPARK SQL FUNCTION TRANSLATIONS (apply inside every spark.sql("...") string):
-  ISNULL(x, y)              → COALESCE(x, y)
-  LEN(col)                  → LENGTH(col)
-  GETDATE()                 → CURRENT_TIMESTAMP()
-  GETUTCDATE()              → UTC_TIMESTAMP()
-  CHARINDEX(sub, str)       → LOCATE(sub, str)
-  CHARINDEX(sub, str, pos)  → LOCATE(sub, str, pos)
-  CONVERT(type, col)        → CAST(col AS type)
-  DATEDIFF(unit, start, end)→ DATEDIFF(end, start)   ← ARGS REVERSED in Spark!
-  TOP n                     → LIMIT n  (move to end of SELECT)
-  WITH (NOLOCK)             → remove entirely
-  STRING_AGG(col, delim)    → CONCAT_WS(delim, COLLECT_LIST(col))
-  ISNUMERIC(col)            → col RLIKE '^-?[0-9]+(\\.[0-9]+)?$'
-  PRINT 'msg'               → logger.info('msg')
-  @@ROWCOUNT                → result_df_prev.count()
-  RAISERROR(msg, …)         → raise ValueError(msg)
-  MERGE INTO (T-SQL syntax) → keep as-is — Spark SQL 3.0+ supports MERGE INTO
-  PIVOT / UNPIVOT           → SUM(CASE WHEN col='v' THEN val_col END) AS alias
-  EXEC @dynamic_sql         → spark.sql(f"{dynamic_var}")
-  OUTPUT INTO #t            → CREATE OR REPLACE TEMP VIEW after INSERT
+    Now convert the SQL provided in the user message. Output ONLY the Python code — nothing else.
 """)
 
 _EXPLAIN_SYSTEM = textwrap.dedent("""\
