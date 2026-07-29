@@ -156,7 +156,7 @@
     <h1>&#9889; SQL &rarr; PySpark <span style="color:#93C5FD;">AI</span> Converter</h1>
   </div>
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-    <span id="providerBadge" style="background:rgba(124,58,237,.3);color:#C4B5FD;border:1px solid rgba(196,181,253,.3);padding:4px 11px;border-radius:20px;font-size:.74rem;font-weight:700;letter-spacing:.3px;">&#129302; AI</span>
+    <span id="providerBadge" style="background:rgba(124,58,237,.3);color:#C4B5FD;border:1px solid rgba(196,181,253,.3);padding:4px 11px;border-radius:20px;font-size:.74rem;font-weight:700;letter-spacing:.3px;">AI</span>
     <span style="background:rgba(226,88,34,.25);color:#FCA57A;border:1px solid rgba(252,165,122,.3);padding:4px 11px;border-radius:20px;font-size:.74rem;font-weight:700;">&#9733; Apache Spark</span>
     <span class="live-badge">
       <span class="live-dot off" id="headerDot"></span>
@@ -172,7 +172,7 @@
   <span style="margin:0 6px;opacity:.5;font-size:.85rem;">&rarr;</span>
   <span id="ps2" style="background:rgba(255,255,255,.12);padding:4px 14px;border-radius:20px;font-size:.76rem;font-weight:700;transition:all .35s ease;">&#128269; Parse &amp; Analyze</span>
   <span style="margin:0 6px;opacity:.5;font-size:.85rem;">&rarr;</span>
-  <span id="ps3" style="background:rgba(124,58,237,.4);padding:4px 14px;border-radius:20px;font-size:.76rem;font-weight:700;border:1px solid rgba(196,181,253,.3);transition:all .35s ease;">&#129302; Rule Engine + AI</span>
+  <span id="ps3" style="background:rgba(124,58,237,.4);padding:4px 14px;border-radius:20px;font-size:.76rem;font-weight:700;border:1px solid rgba(196,181,253,.3);transition:all .35s ease;">Rule Engine + AI</span>
   <span style="margin:0 6px;opacity:.5;font-size:.85rem;">&rarr;</span>
   <span id="ps4" style="background:rgba(255,255,255,.12);padding:4px 14px;border-radius:20px;font-size:.76rem;font-weight:700;transition:all .35s ease;">&#9889; PySpark Code</span>
   <span style="margin:0 6px;opacity:.5;font-size:.85rem;">&rarr;</span>
@@ -187,12 +187,7 @@
       <option value="">&#8212; load a sample &#8212;</option>
       {% for s in samples %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
     </select>
-    <div style="width:1px;height:24px;background:#CBD5E1;margin:0 2px;"></div>
-    <label style="margin:0;">SQL Type:</label>
-    <select id="dialect" style="width:auto;min-width:175px;">
-      <option value="tsql" selected>&#129695; SQL Server (T-SQL)</option>
-      <option value="ansi">&#128203; Standard SQL (ANSI)</option>
-    </select>
+
   </div>
  
   <div class="grid">
@@ -250,9 +245,9 @@ ORDER BY emp_count DESC;"></textarea>
           <input type="file" id="fileInput" accept=".sql,.txt" onchange="handleFileSelect(event)"/>
           <div class="prog-bar" id="progBar"><div class="prog-fill" id="progFill"></div></div>
           <div id="uploadPreview" style="display:none;margin-top:8px;">
-            <label>Preview (first 20 lines):</label>
-            <textarea id="previewText" rows="8" readonly
-              style="background:#F8FAFF;color:#333;font-size:.78rem;"></textarea>
+            <label id="previewLabel">Full file preview &mdash; <span style="color:#059669;font-weight:600;">all lines will be converted</span></label>
+            <textarea id="previewText" rows="20" readonly
+              style="background:#F8FAFF;color:#333;font-size:.78rem;resize:vertical;max-height:600px;"></textarea>
           </div>
         </div>
  
@@ -277,11 +272,12 @@ ORDER BY emp_count DESC;"></textarea>
             style="background:#7C3AED;color:white;display:none;"
             title="Use AI for smarter conversion of complex SQL">
             <span class="spinner"></span>
-            <span class="btn-text" id="aiBtnText">&#129302; AI Convert</span>
+            <span class="btn-text" id="aiBtnText">AI Convert</span>
           </button>
           <button class="btn btn-secondary" onclick="clearAll()">&#128465; Clear</button>
         </div>
-        <div id="aiStatus" style="font-size:.75rem;margin-top:6px;display:none;"></div>
+        <div id="modelHint" style="font-size:.75rem;margin-top:6px;padding:4px 8px;border-radius:6px;background:rgba(0,0,0,.04);min-height:1.4em;"></div>
+        <div id="aiStatus" style="display:none;"></div>
  
       </div>
     </div>
@@ -567,6 +563,7 @@ def raise_salaries(
     var t = ta.value;
     document.getElementById("charCount").textContent = t.length.toLocaleString() + " characters";
     document.getElementById("lineCount").textContent = t.split("\n").length.toLocaleString() + " lines";
+    updateModelHint();
     if (liveMode) {
       clearTimeout(debounceTimer);
       document.getElementById("liveStatus").style.display = "inline";
@@ -675,9 +672,11 @@ def raise_salaries(
       var fn = document.getElementById("uploadedFileName");
       fn.textContent = d.filename + "  (" + (d.size/1024).toFixed(1) + " KB)";
       fn.style.display = "block";
-      var lines = d.content.split("\n").slice(0,20).join("\n");
-      document.getElementById("previewText").value = lines + (d.content.split("\n").length>20 ? "\n...(truncated)" : "");
+      var allLines = d.content.split("\n");
+      document.getElementById("previewLabel").innerHTML = "Full file preview &mdash; <span style='color:#059669;font-weight:600;'>" + allLines.length + " lines loaded, all will be converted</span>";
+      document.getElementById("previewText").value = d.content;
       document.getElementById("uploadPreview").style.display = "block";
+      updateModelHint();
       showToast("File loaded: " + d.filename + " — click Convert!","success");
       if (liveMode) convertSQL(true);
     }).catch(function(err) {
@@ -862,27 +861,59 @@ def raise_salaries(
 
  
   // Check AI status on load and show/hide AI buttons
+  var _aiSmallModel = "", _aiLargeModel = "", _aiThreshold = 4000, _aiProvider = "AI";
+
   (function checkAIStatus() {
     fetch("/ai-status").then(function(r){ return r.json(); }).then(function(d) {
       var aiAvailable = d.available;
-      var aiBtn = document.getElementById("aiBtn");
+      var aiBtn   = document.getElementById("aiBtn");
       var statusEl = document.getElementById("aiStatus");
-      var provider = (d.provider || "AI");
-      var model    = (d.model || "");
-      var label    = provider + " / " + model;
+      _aiProvider    = (d.provider || "AI");
+      _aiSmallModel  = (d.small_model || d.model || "");
+      _aiLargeModel  = (d.large_model || d.model || "");
+      _aiThreshold   = (d.input_threshold || 4000);
+
       if (aiAvailable) {
         aiBtn.style.display = "inline-flex";
-        statusEl.style.display = "block";
-        document.getElementById("aiBtnText").textContent = "\u{1F916} AI Convert (" + provider + ")";
-        document.getElementById("providerBadge").textContent = "\u{1F916} " + label;
-        document.getElementById("ps3").textContent = "\u{1F916} Rule Engine + " + provider;
-        statusEl.innerHTML = "<span style='color:#7C3AED;font-weight:600;'>&#129302; " + label + " ready</span> &mdash; AI Convert uses " + provider + " for smarter SQL\u2192PySpark SQL conversion.";
+        statusEl.style.display = "none";
+
+        // Badge: show both models if they differ
+        var badge = document.getElementById("providerBadge");
+        if (_aiSmallModel !== _aiLargeModel) {
+          badge.innerHTML = _aiProvider + " ● <span title='Small queries'>⚡ " + _aiSmallModel + "</span> &nbsp;|&nbsp; <span title='Large SQL / SPs'>⭐ " + _aiLargeModel + "</span>";
+        } else {
+          badge.textContent = _aiProvider + " / " + _aiSmallModel;
+        }
+
+        // Pipeline step
+        document.getElementById("ps3").textContent = "Smart AI (" + _aiProvider + ")";
+
+        // AI button label
+        document.getElementById("aiBtnText").textContent = "AI Convert (" + _aiProvider + ")";
+
+        // Model hint below buttons — update whenever SQL changes
+        updateModelHint();
       } else {
-        statusEl.style.display = "block";
-        statusEl.innerHTML = "<span style='color:#9CA3AF;'>&#9888; AI not configured &mdash; start Ollama or set an API key in <code>.env</code>.</span>";
+        statusEl.style.display = "none";
       }
     }).catch(function(){});
   })();
+
+  function updateModelHint() {
+    var hintEl = document.getElementById("modelHint");
+    if (!hintEl || !_aiSmallModel) return;
+    var sql = getSQL();
+    var isLarge = sql.length >= _aiThreshold;
+    if (_aiSmallModel === _aiLargeModel) {
+      hintEl.textContent = "Model: " + _aiSmallModel;
+    } else if (isLarge) {
+      hintEl.innerHTML = "⭐ Large input detected — AI will use <strong>" + _aiLargeModel + "</strong> for best accuracy";
+      hintEl.style.color = "#7C3AED";
+    } else {
+      hintEl.innerHTML = "⚡ Small input — AI will use <strong>" + _aiSmallModel + "</strong> (fast)";
+      hintEl.style.color = "#059669";
+    }
+  }
  
   // Animated progress dots while Ollama is generating
   var _aiTimer = null;
@@ -924,7 +955,6 @@ def raise_salaries(
   function convertWithAI() {
     var sql = getSQL();
     var db  = "";
-    var dialect = document.getElementById("dialect").options[document.getElementById("dialect").selectedIndex].text;
     if (!sql) { showToast("Please enter or upload SQL first.", "warn"); return; }
 
     var btn = document.getElementById("aiBtn");
@@ -947,7 +977,7 @@ def raise_salaries(
     fetch("/ai-convert-stream", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({sql: sql, db_prefix: db, dialect: dialect})
+      body: JSON.stringify({sql: sql, db_prefix: db})
     }).then(function(response) {
       if (!response.ok) {
         return response.json().then(function(d){ throw new Error(d.error || "HTTP " + response.status); });
@@ -1003,8 +1033,9 @@ def raise_salaries(
 
                 out.textContent = cleanCode;
                 out.classList.remove("placeholder");
+                var modelLabel = d.model_used ? (" — " + d.model_used) : "";
                 document.getElementById("outFilename").textContent =
-                  "\uD83E\uDD16 Ollama AI \u2014 " + lastSpName + "_pyspark.py";
+                  _aiProvider + modelLabel + " — " + lastSpName + "_pyspark.py";
 
                 renderQuickView(cleanCode, sql);
                 switchTab("tq", document.querySelectorAll(".tab")[0]);
@@ -1017,9 +1048,10 @@ def raise_salaries(
                 setTimeout(function(){ _litPipelineStep(0); }, 3000);
 
                 if (d.syntax_valid === false) {
-                  showToast("\u26A0 AI done \u2014 syntax warning, check Warnings tab", "warn");
+                  showToast("⚠ AI done — syntax warning, check Warnings tab", "warn");
                 } else {
-                  showToast("\u2705 AI conversion complete \u2014 syntax valid!", "success");
+                  var mLabel = d.model_used ? " via " + d.model_used : "";
+                  showToast("✅ AI conversion complete" + mLabel + " — syntax valid!", "success");
                 }
               } catch(e) {
                 console.error("RESULT parse error", e);

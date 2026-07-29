@@ -1,18 +1,24 @@
-MODEL CARD — qwen2.5-coder:7b
-==============================
+MODEL CARD — Dual-Model Setup (Speed + Accuracy)
+=================================================
 
-Full Name   : Qwen2.5-Coder-7B-Instruct (Q4_K_M quantized)
-Model ID    : dae161e27b0e
-Developer   : Alibaba Cloud / Qwen Team
-License     : Apache 2.0 (free for commercial use)
-Downloaded  : 2026-07-13
-Local Path  : %USERPROFILE%\.ollama\models\blobs\
+ACTIVE MODELS
+-------------
+Small/Fast  : qwen2.5-coder:1.5b  (986 MB)  — simple queries  (< 4000 chars)
+Large/Accurate: qwen2.5-coder:7b  (4.7 GB)  — stored procedures (≥ 4000 chars)
 
-TECHNICAL SPECS
----------------
+qwen2.5-coder:7b
+  Full Name   : Qwen2.5-Coder-7B-Instruct (Q4_K_M quantized)
+  Model ID    : dae161e27b0e
+  Developer   : Alibaba Cloud / Qwen Team
+  License     : Apache 2.0 (free for commercial use)
+  Downloaded  : 2026-07-13
+  Local Path  : %USERPROFILE%\.ollama\models\blobs\
+
+TECHNICAL SPECS (7b)
+---------------------
 Architecture      : Qwen2 (transformer decoder)
 Parameters        : 7.6 billion
-Context Length    : 32,768 tokens (full context)
+Context Length    : 32,768 tokens (full capacity) / 6,144 tokens (configured)
 Embedding Length  : 3,584
 Quantization      : Q4_K_M  (4-bit, K-means, medium quality)
   → Full precision would be ~28 GB; Q4_K_M reduces to 4.7 GB
@@ -25,9 +31,12 @@ Capabilities
 
 PERFORMANCE IN THIS PROJECT
 ----------------------------
-Conversion speed (CPU only)  : 10–30 tokens/second
-Typical SP conversion time   : 30–90 seconds
-Simple query conversion time : 15–30 seconds
+                         1.5b (small)    7b (large)
+Conversion speed (CPU) : 40–80 t/s       10–30 t/s
+Simple query time      : 5–12 seconds    15–30 seconds
+Stored proc time       : N/A (routed)    25–60 seconds
+
+Routing rule: SQL input < 4000 chars → 1.5b  |  ≥ 4000 chars → 7b
 
 What it does well
   ✓ SQL → PySpark SQL conversion (spark.sql())
@@ -70,7 +79,6 @@ API key needed : None
 ALTERNATIVES (if higher quality needed)
 -----------------------------------------
 Model                   Size    Cost    Notes
-qwen2.5-coder:14b       9 GB    $0      Higher quality, needs more RAM
 codellama:34b           19 GB   $0      Best open-source code model (needs GPU)
 GPT-4.1-mini (OpenAI)   Cloud   Paid    Fastest, highest quality
 claude-3-5-haiku        Cloud   Paid    Good balance of speed/quality

@@ -24,13 +24,14 @@ from ai_provider.ai_provider import (
     convert_sql_with_ai,
     is_available as ai_available,
     get_provider_info,
+    get_model_for_input,
     explain_pyspark_code,
     optimize_pyspark_code,
 )
 
 app = Flask(__name__, template_folder="web_ui/templates")
 app.config["JSON_SORT_KEYS"] = False
-app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5 MB upload limit
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB upload limit
 
 ALLOWED_EXTENSIONS = {".sql", ".txt"}
 
@@ -249,9 +250,12 @@ def ai_status():
     """Return the active AI provider, model, and availability status."""
     info = get_provider_info()
     return jsonify({
-        "available": info["available"],
-        "provider":  info["provider"],
-        "model":     info["model"],
+        "available":        info["available"],
+        "provider":         info["provider"],
+        "model":            info["model"],
+        "small_model":      info.get("small_model", info["model"]),
+        "large_model":      info.get("large_model", info["model"]),
+        "input_threshold":  info.get("input_threshold", 0),
     })
  
  
@@ -293,11 +297,13 @@ def ai_convert():
         out_file.write_text(code, encoding="utf-8")
 
         info = get_provider_info()
+        model_used = get_model_for_input(sql_text) if info["provider"] == "ollama" else info["model"]
         return jsonify({
             "code":             code,
             "quick_code":       code,
             "sp_name":          safe_name,
-            "source":           f"{info['provider']}/{info['model']}",
+            "source":           f"{info['provider']}/{model_used}",
+            "model_used":       model_used,
             "syntax_valid":     post.syntax_valid,
             "syntax_error":     post.syntax_error,
             "warnings":         post.warnings,
@@ -333,7 +339,9 @@ def ai_convert_stream():
             yield "data: [STEP] Analysing SQL structure (Stage 1/3)\n\n"
             pre = preprocess(sql_text)
 
-            yield "data: [STEP] Sending to AI (Stage 2/3 - please wait)\n\n"
+            info = get_provider_info()
+            model_used = get_model_for_input(sql_text) if info["provider"] == "ollama" else info["model"]
+            yield f"data: [STEP] Sending to AI — {model_used} (Stage 2/3 — please wait)\n\n"
             code = convert_sql_with_ai(sql_text, db_prefix="", dialect=dialect)
 
             yield "data: [STEP] Validating and cleaning output (Stage 3/3)\n\n"
@@ -349,6 +357,7 @@ def ai_convert_stream():
                     "sp_name":      safe_name,
                     "syntax_valid": post.syntax_valid,
                     "warnings":     post.warnings,
+                    "model_used":   model_used,
                 },
                 ensure_ascii=True,
             )

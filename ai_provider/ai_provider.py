@@ -51,8 +51,57 @@ _OAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 _OAI_BASE_URL    = os.getenv("OPENAI_BASE_URL")
 _HF_MODEL        = os.getenv("HF_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct")
 _GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-_OLLAMA_URL      = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-_OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "codellama")
+_OLLAMA_URL        = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+# Small/fast model for short queries (<= threshold); 1.5b is ~3× faster than 7b on CPU
+_OLLAMA_MODEL      = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
+# Explicit override for large-input model (optional — auto-selected if blank)
+_OLLAMA_MODEL_LARGE = os.getenv("OLLAMA_MODEL_LARGE", "")
+# Character threshold above which the large model is selected (~120 lines of SQL)
+_LARGE_INPUT_THRESHOLD = 4000
+
+# Priority list: best model for SQL code conversion → fallback order
+_MODEL_PRIORITY = [
+    "qwen2.5-coder:32b",
+    "qwen2.5-coder:7b",
+    "deepseek-coder-v2:16b",
+    "codellama:34b",
+    "qwen2.5-coder:3b",
+    "qwen2.5-coder:1.5b",
+    "codellama",
+]
+
+# Cache so we only query Ollama once per process
+_best_large_model_cache: str | None = None
+
+
+def _get_best_large_model() -> str:
+    """Query Ollama for installed models and return the highest-ranked one.
+
+    Uses _MODEL_PRIORITY order. Falls back to _OLLAMA_MODEL if nothing matches.
+    Result is cached for the lifetime of the process.
+    """
+    global _best_large_model_cache
+    # Honour explicit env override
+    if _OLLAMA_MODEL_LARGE:
+        return _OLLAMA_MODEL_LARGE
+    if _best_large_model_cache is not None:
+        return _best_large_model_cache
+    try:
+        with urllib.request.urlopen(f"{_OLLAMA_URL}/api/tags", timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        installed = [m["name"] for m in data.get("models", [])]
+        # Normalize: strip digest suffix if present (e.g. "qwen2.5-coder:7b:latest" → "qwen2.5-coder:7b")
+        installed_base = [n.split(":")[0] + ":" + n.split(":")[1] if n.count(":") >= 1 else n
+                          for n in installed]
+        for candidate in _MODEL_PRIORITY:
+            if candidate in installed_base or candidate in installed:
+                _best_large_model_cache = candidate
+                return candidate
+    except Exception:
+        pass
+    # Fallback: use whatever is configured as the default model
+    _best_large_model_cache = _OLLAMA_MODEL
+    return _OLLAMA_MODEL
 
 
 # ── Provider detection ────────────────────────────────────────────────────────
@@ -87,6 +136,18 @@ def _detect_provider() -> str:
     if os.getenv("ANTHROPIC_API_KEY"):
         return "anthropic"
     return "ollama"   # default target even if not yet reachable
+
+
+def get_model_for_input(sql: str) -> str:
+    """Return the Ollama model that will be used for the given SQL string.
+
+    Mirrors the auto-selection logic in _chat_ollama / _stream_ollama:
+      - Short SQL (< _LARGE_INPUT_THRESHOLD chars) → small/fast model
+      - Large SQL (≥ _LARGE_INPUT_THRESHOLD chars) → best available large model
+    """
+    if len(sql) >= _LARGE_INPUT_THRESHOLD:
+        return _get_best_large_model()
+    return _OLLAMA_MODEL
 
 
 def is_available() -> bool:
@@ -125,17 +186,36 @@ def is_available() -> bool:
 def get_provider_info() -> dict:
     """Return a dict describing the active provider and model."""
     provider = _detect_provider()
+    if provider == "ollama":
+        small_model = _OLLAMA_MODEL
+        large_model = _get_best_large_model()
+        model_display = (
+            f"{large_model} (large) / {small_model} (small)"
+            if large_model != small_model
+            else small_model
+        )
+        return {
+            "provider":          provider,
+            "model":             model_display,
+            "small_model":       small_model,
+            "large_model":       large_model,
+            "input_threshold":   _LARGE_INPUT_THRESHOLD,
+            "available":         is_available(),
+        }
     model_map = {
         "anthropic":   _ANTHROPIC_MODEL,
         "openai":      _OAI_MODEL,
         "huggingface": _HF_MODEL,
         "gemini":      _GEMINI_MODEL,
-        "ollama":      _OLLAMA_MODEL,
     }
+    model_display = model_map.get(provider, "unknown")
     return {
-        "provider": provider,
-        "model":    model_map.get(provider, "unknown"),
-        "available": is_available(),
+        "provider":    provider,
+        "model":       model_display,
+        "small_model": model_display,
+        "large_model": model_display,
+        "input_threshold": 0,
+        "available":   is_available(),
     }
 
 
@@ -309,21 +389,49 @@ def _chat_gemini(system_prompt: str, user_prompt: str, temperature: float) -> st
 
 
 def _chat_ollama(system_prompt: str, user_prompt: str, temperature: float) -> str:
-    """Call local Ollama server (completely free, runs on your machine)."""
+    """Call local Ollama server (completely free, runs on your machine).
+
+    Auto-selects model based on input size:
+      - Small input (< 4000 chars) → OLLAMA_MODEL (fast, e.g. qwen2.5-coder:1.5b)
+      - Large input (≥ 4000 chars) → best available large model (e.g. qwen2.5-coder:7b)
+
+    Context window scales dynamically with input length so that even 500-line
+    stored procedures fit without truncation.
+    """
+    total_input = len(system_prompt) + len(user_prompt)
+    is_large = total_input >= _LARGE_INPUT_THRESHOLD
+    model = _get_best_large_model() if is_large else _OLLAMA_MODEL
+
+    # Dynamic context window: 1 token ≈ 4 chars (conservative estimate for SQL/code)
+    input_tokens_est = total_input // 4
+    # Output budget: typically 50-70% of input size, capped at 6144 (covers 1000-line SPs)
+    output_budget = max(1200, min(6144, int(input_tokens_est * 0.65)))
+    # Round ctx up to next multiple of 2048 with a safety margin
+    raw_ctx = input_tokens_est + output_budget + 256
+    num_ctx     = max(3072, min(32768, ((raw_ctx + 2047) // 2048) * 2048))
+    num_predict = output_budget
+    # Scale timeout: assume ~7 tokens/sec worst-case on CPU, cap at 600s
+    timeout_s   = max(300, min(600, num_predict // 7))
+
     url = f"{_OLLAMA_URL}/api/chat"
     payload = json.dumps({
-        "model": _OLLAMA_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ],
         "options": {
-            "temperature":    0.05,  # near-deterministic → consistent, faster
-            "top_k":          10,   # narrow token pool → faster sampling
+            "temperature":    0.0,    # greedy decoding: fastest + most accurate for code
+            "seed":           42,     # reproducible output — no re-sampling variance
+            "top_k":          20,
             "top_p":          0.9,
-            "num_predict":    800,  # cap output tokens (800 ≈ 400 lines of code)
-            "num_ctx":        2048, # halved context → 2× faster attention
-            "repeat_penalty": 1.1, # avoid repetitive output
+            "penalize_newline": False, # never penalise newlines in code output
+            "num_keep":       48,     # cache system-prompt prefix in KV across calls
+            "num_predict":    num_predict,
+            "num_ctx":        num_ctx,
+            "repeat_penalty": 1.15,  # higher → fewer repetitive code-loop artifacts
+            "num_thread":     os.cpu_count() or 8,
+            "num_batch":      1024,
         },
         "stream": False,
     }).encode("utf-8")
@@ -331,7 +439,7 @@ def _chat_ollama(system_prompt: str, user_prompt: str, temperature: float) -> st
         url, data=payload, headers={"Content-Type": "application/json"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return (data.get("message", {}).get("content") or "").strip()
     except urllib.error.URLError as exc:
@@ -344,23 +452,38 @@ def _chat_ollama(system_prompt: str, user_prompt: str, temperature: float) -> st
 def _stream_ollama(system_prompt: str, user_prompt: str, temperature: float):
     """Stream tokens from Ollama one chunk at a time (generator).
 
+    Auto-selects model based on input size (same logic as _chat_ollama).
     Yields str chunks as Ollama produces them.
     Raises RuntimeError if Ollama is not reachable.
     """
+    total_input = len(system_prompt) + len(user_prompt)
+    is_large = total_input >= _LARGE_INPUT_THRESHOLD
+    model = _get_best_large_model() if is_large else _OLLAMA_MODEL
+    # Same dynamic sizing as _chat_ollama
+    input_tokens_est = total_input // 4
+    output_budget = max(1200, min(6144, int(input_tokens_est * 0.65)))
+    raw_ctx     = input_tokens_est + output_budget + 256
+    num_ctx     = max(3072, min(32768, ((raw_ctx + 2047) // 2048) * 2048))
+    num_predict = output_budget
     url = f"{_OLLAMA_URL}/api/chat"
     payload = json.dumps({
-        "model": _OLLAMA_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ],
         "options": {
-            "temperature":    temperature,
-            "top_k":          10,
+            "temperature":    0.0,
+            "seed":           42,
+            "top_k":          20,
             "top_p":          0.9,
-            "num_predict":    800,
-            "num_ctx":        2048,
-            "repeat_penalty": 1.1,
+            "penalize_newline": False,
+            "num_keep":       48,
+            "num_predict":    num_predict,
+            "num_ctx":        num_ctx,
+            "repeat_penalty": 1.15,
+            "num_thread":     os.cpu_count() or 8,
+            "num_batch":      1024,
         },
         "stream": True,
     }).encode("utf-8")
@@ -490,6 +613,27 @@ _CONVERT_SYSTEM = textwrap.dedent("""\
             return result_df
 
     Output ONLY the Python code — nothing else.
+
+T-SQL → SPARK SQL FUNCTION TRANSLATIONS (apply inside every spark.sql("...") string):
+  ISNULL(x, y)              → COALESCE(x, y)
+  LEN(col)                  → LENGTH(col)
+  GETDATE()                 → CURRENT_TIMESTAMP()
+  GETUTCDATE()              → UTC_TIMESTAMP()
+  CHARINDEX(sub, str)       → LOCATE(sub, str)
+  CHARINDEX(sub, str, pos)  → LOCATE(sub, str, pos)
+  CONVERT(type, col)        → CAST(col AS type)
+  DATEDIFF(unit, start, end)→ DATEDIFF(end, start)   ← ARGS REVERSED in Spark!
+  TOP n                     → LIMIT n  (move to end of SELECT)
+  WITH (NOLOCK)             → remove entirely
+  STRING_AGG(col, delim)    → CONCAT_WS(delim, COLLECT_LIST(col))
+  ISNUMERIC(col)            → col RLIKE '^-?[0-9]+(\\.[0-9]+)?$'
+  PRINT 'msg'               → logger.info('msg')
+  @@ROWCOUNT                → result_df_prev.count()
+  RAISERROR(msg, …)         → raise ValueError(msg)
+  MERGE INTO (T-SQL syntax) → keep as-is — Spark SQL 3.0+ supports MERGE INTO
+  PIVOT / UNPIVOT           → SUM(CASE WHEN col='v' THEN val_col END) AS alias
+  EXEC @dynamic_sql         → spark.sql(f"{dynamic_var}")
+  OUTPUT INTO #t            → CREATE OR REPLACE TEMP VIEW after INSERT
 """)
 
 _EXPLAIN_SYSTEM = textwrap.dedent("""\
@@ -562,6 +706,41 @@ _ANALYZE_SYSTEM = textwrap.dedent("""\
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _build_convert_user_prompt(sql: str, db_prefix: str, dialect: str) -> str:
+    """Build the enriched user prompt for both batch and streaming conversion.
+
+    Runs the preprocessor to clean T-SQL noise and extract metadata, then
+    injects that context into the prompt so the model has maximum signal.
+    """
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from converter.sql_preprocessor import preprocess
+    pre = preprocess(sql)
+
+    hint_lines = ""
+    if pre.is_stored_procedure:
+        hint_lines += f"  - Stored procedure name : {pre.sp_name}\n"
+    if pre.parameters:
+        params_str = ", ".join(
+            f"{p['name']} {p['type']}" + (f" = {p['default']}" if p['default'] else "")
+            for p in pre.parameters
+        )
+        hint_lines += f"  - Parameters            : {params_str}\n"
+    if pre.temp_tables:
+        hint_lines += f"  - Temp tables detected  : {', '.join(pre.temp_tables)}\n"
+    if pre.dialect_hints:
+        hint_lines += f"  - Complexity flags      : {', '.join(pre.dialect_hints)}\n"
+
+    context_block = f"\nSQL Context:\n{hint_lines}" if hint_lines else ""
+    return textwrap.dedent(f"""\
+        Database prefix for permanent tables: \"{db_prefix}\"
+        {context_block}
+        SQL to convert:
+        ---
+        {pre.cleaned_sql}
+        ---
+    """), pre
+
+
 def convert_sql_with_ai(
     sql: str,
     db_prefix: str = "my_db",
@@ -590,37 +769,8 @@ def convert_sql_with_ai(
     Raises:
         RuntimeError: if no AI provider is configured or the API call fails.
     """
-    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-
-    # Stage 1: Preprocess
-    from converter.sql_preprocessor import preprocess
-    pre = preprocess(sql)
-
-    # Build hint annotations for the prompt
-    hint_lines = ""
-    if pre.is_stored_procedure:
-        hint_lines += f"  - Stored procedure name : {pre.sp_name}\n"
-    if pre.parameters:
-        params_str = ", ".join(
-            f"{p['name']} {p['type']}" + (f" = {p['default']}" if p['default'] else "")
-            for p in pre.parameters
-        )
-        hint_lines += f"  - Parameters            : {params_str}\n"
-    if pre.temp_tables:
-        hint_lines += f"  - Temp tables detected  : {', '.join(pre.temp_tables)}\n"
-    if pre.dialect_hints:
-        hint_lines += f"  - Complexity flags      : {', '.join(pre.dialect_hints)}\n"
-
-    context_block = f"\nSQL Context:\n{hint_lines}" if hint_lines else ""
-
-    user_prompt = textwrap.dedent(f"""\
-        Database prefix for permanent tables: "{db_prefix}"
-        {context_block}
-        SQL to convert:
-        ---
-        {pre.cleaned_sql}
-        ---
-    """)
+    # Stage 1 + prompt build (shared with streaming path)
+    user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
 
     # ── Stage 2: LLM ────────────────────────────────────────────────────────
     raw_output = _chat(_CONVERT_SYSTEM, user_prompt)
@@ -647,26 +797,11 @@ def stream_sql_with_ai(
     Yields:
         str chunks as the model generates them.
     """
-    user_prompt = textwrap.dedent(f"""\
-        Convert the following {dialect} SQL to PySpark SQL.
-        Database prefix: "{db_prefix}"
-
-        SQL Input:
-        ---
-        {sql}
-        ---
-
-        Requirements:
-        - Use spark.sql("...") for ALL SQL queries (PySpark SQL format).
-        - Wrap logic in a typed Python function with spark: SparkSession as first arg.
-        - Cursors → single batch spark.sql() UPDATE/INSERT (never row-by-row).
-        - Temp tables → spark.sql("CREATE OR REPLACE TEMP VIEW ...").
-        - Transactions → Delta Lake ACID (add comment, no BEGIN/COMMIT).
-        - Output ONLY runnable Python code — no Markdown fences.
-    """)
+    # Use the same enriched, preprocessed prompt as the batch path
+    user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
     provider = _detect_provider()
     if provider == "ollama":
-        yield from _stream_ollama(_CONVERT_SYSTEM, user_prompt, temperature=0.2)
+        yield from _stream_ollama(_CONVERT_SYSTEM, user_prompt, temperature=0.0)
     else:
         # Non-streaming fallback: yield the full result as one chunk
         yield _clean_ai_output(_chat(_CONVERT_SYSTEM, user_prompt))

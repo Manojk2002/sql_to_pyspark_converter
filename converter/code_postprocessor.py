@@ -265,6 +265,12 @@ def postprocess(raw_output: str) -> PostprocessResult:
     # Step 1: Strip fences and prose
     code = _strip_fences(raw_output)
 
+    # Step 1b: Decode HTML entities and strip HTML tags that some models return
+    import html as _html
+    code = _html.unescape(code)                         # &gt;= → >=, &lt;= → <=, -&gt; → ->
+    code = re.sub(r"<br\s*/?>", "\n", code)             # <br> / <br/> → newline
+    code = re.sub(r"<[^>]+>", "", code)                 # strip any remaining HTML tags
+
     # Guard: remove SSE artifacts that may have been passed in raw SSE text
     code = re.sub(r"\[RESULT\]\s*\{.*", "", code, flags=re.DOTALL).strip()
     code = re.sub(r"data:\s*\[(?:RESULT|DONE|ERROR)\].*", "", code, flags=re.DOTALL).strip()
