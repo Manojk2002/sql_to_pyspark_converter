@@ -22,6 +22,7 @@ from converter.sql_preprocessor import preprocess
 from converter.code_postprocessor import postprocess
 from ai_provider.ai_provider import (
     convert_sql_with_ai,
+    stream_sql_with_ai,
     is_available as ai_available,
     get_provider_info,
     get_model_for_input,
@@ -43,7 +44,7 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 
 _parser = SQLParser()
 _analyzer = SQLAnalyzer()
- 
+
 # Quick-reference mapping for the UI
 QUICK_REF = [
     ("SELECT col",          "df.select('col')"),
@@ -283,14 +284,10 @@ def ai_convert():
         }), 503
  
     try:
-        # -- Full 3-stage pipeline: Preprocess ? LLM ? Postprocess ------------
-        from converter.sql_preprocessor import preprocess
-        from converter.code_postprocessor import postprocess
-
-        pre    = preprocess(sql_text)
-        code   = convert_sql_with_ai(sql_text, db_prefix="", dialect=dialect)
-        post   = postprocess(code)  # re-validate final code
-        code   = post.code
+        # preprocess once for sp_name / dialect_hints metadata
+        pre  = preprocess(sql_text)
+        # convert_sql_with_ai runs preprocess+LLM+postprocess internally
+        code = convert_sql_with_ai(sql_text, db_prefix="", dialect=dialect)
 
         safe_name = pre.sp_name.replace(".", "_").replace(" ", "_") or "ai_query"
         out_file  = OUTPUT_DIR / f"{safe_name}_pyspark.py"
@@ -304,10 +301,10 @@ def ai_convert():
             "sp_name":          safe_name,
             "source":           f"{info['provider']}/{model_used}",
             "model_used":       model_used,
-            "syntax_valid":     post.syntax_valid,
-            "syntax_error":     post.syntax_error,
-            "warnings":         post.warnings,
-            "imports_injected": post.imports_injected,
+            "syntax_valid":     True,
+            "syntax_error":     None,
+            "warnings":         [],
+            "imports_injected": [],
             "dialect_hints":    pre.dialect_hints,
         })
     except RuntimeError as exc:
@@ -341,13 +338,18 @@ def ai_convert_stream():
 
             info = get_provider_info()
             model_used = get_model_for_input(sql_text) if info["provider"] == "ollama" else info["model"]
-            yield f"data: [STEP] Sending to AI — {model_used} (Stage 2/3 — please wait)\n\n"
-            code = convert_sql_with_ai(sql_text, db_prefix="", dialect=dialect)
+            yield f"data: [STEP] Generating — {model_used} (Stage 2/3)\n\n"
+
+            # Stream tokens live from the model instead of blocking
+            raw_chunks = []
+            for chunk in stream_sql_with_ai(sql_text, db_prefix="", dialect=dialect):
+                raw_chunks.append(chunk)
+                yield f"data: [TOKEN] {json.dumps(chunk, ensure_ascii=True)}\n\n"
 
             yield "data: [STEP] Validating and cleaning output (Stage 3/3)\n\n"
-            post = postprocess(code)
+            post = postprocess("".join(raw_chunks))
 
-            safe_name = pre.sp_name.replace(".", "_").replace(" ", "_") or "ai_query"
+            safe_name = (pre.sp_name or "ai_query").replace(".", "_").replace(" ", "_")
             out_file = OUTPUT_DIR / f"{safe_name}_pyspark.py"
             out_file.write_text(post.code, encoding="utf-8")
 

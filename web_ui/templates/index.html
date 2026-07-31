@@ -105,8 +105,7 @@
     .btn-success{background:var(--success);color:white}
     .btn-group{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}
     @keyframes btnPulse{0%,100%{box-shadow:0 0 0 0 rgba(46,116,181,.55)}60%{box-shadow:0 0 0 7px rgba(46,116,181,0)}}
-    @keyframes psGlow{0%{box-shadow:0 0 8px 3px rgba(255,230,80,.55);filter:brightness(1.7)}100%{box-shadow:0 0 20px 8px rgba(255,230,80,.9);filter:brightness(2.1)}}
-    .ps-active{animation:psGlow 1s ease-in-out infinite alternate;transform:scale(1.08);}
+    .ps-active{background:#f5c400;color:#1a1a1a;font-weight:700;transform:scale(1.08);transition:background .25s,color .25s,transform .25s;}
     .btn-primary.needs-convert{animation:btnPulse 1.6s infinite;background:var(--dark-blue)}
     .spinner{display:none;width:14px;height:14px;border:2.5px solid rgba(255,255,255,.3);
       border-top-color:white;border-radius:50%;animation:spin .7s linear infinite}
@@ -272,7 +271,7 @@ ORDER BY emp_count DESC;"></textarea>
             style="background:#7C3AED;color:white;display:none;"
             title="Use AI for smarter conversion of complex SQL">
             <span class="spinner"></span>
-            <span class="btn-text" id="aiBtnText">AI Convert</span>
+            <span class="btn-text" id="aiBtnText">AI (ollama)</span>
           </button>
           <button class="btn btn-secondary" onclick="clearAll()">&#128465; Clear</button>
         </div>
@@ -673,7 +672,7 @@ def raise_salaries(
       fn.textContent = d.filename + "  (" + (d.size/1024).toFixed(1) + " KB)";
       fn.style.display = "block";
       var allLines = d.content.split("\n");
-      document.getElementById("previewLabel").innerHTML = "Full file preview &mdash; <span style='color:#059669;font-weight:600;'>" + allLines.length + " lines loaded, all will be converted</span>";
+      document.getElementById("previewLabel").innerHTML = "Full file preview &mdash; <span style='color:#059669;font-weight:600;'>" + allLines.length + " lines loaded</span>";
       document.getElementById("previewText").value = d.content;
       document.getElementById("uploadPreview").style.display = "block";
       updateModelHint();
@@ -886,10 +885,10 @@ def raise_salaries(
         }
 
         // Pipeline step
-        document.getElementById("ps3").textContent = "Smart AI (" + _aiProvider + ")";
+        document.getElementById("ps3").textContent = "AI (" + _aiProvider + ")";
 
         // AI button label
-        document.getElementById("aiBtnText").textContent = "AI Convert (" + _aiProvider + ")";
+        document.getElementById("aiBtnText").textContent = "AI (" + _aiProvider + ")";
 
         // Model hint below buttons — update whenever SQL changes
         updateModelHint();
@@ -985,6 +984,7 @@ def raise_salaries(
       var reader  = response.body.getReader();
       var decoder = new TextDecoder();
       var sseBuf  = "";
+      var streamBuffer = "";  // accumulates live tokens for display
 
       function pump() {
         reader.read().then(function(chunk) {
@@ -999,6 +999,15 @@ def raise_salaries(
 
             if (payload === "[DONE]") {
               btn.classList.remove("loading"); btn.disabled = false;
+              return;
+            }
+            // Live token streaming — show each chunk as it arrives
+            if (payload.startsWith("[TOKEN] ")) {
+              var tok;
+              try { tok = JSON.parse(payload.slice(8)); } catch(e) { tok = payload.slice(8); }
+              streamBuffer += tok;
+              qOut.textContent = streamBuffer;
+              out.textContent  = streamBuffer;
               return;
             }
             if (payload.startsWith("[ERROR]")) {

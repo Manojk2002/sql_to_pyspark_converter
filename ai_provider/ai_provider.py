@@ -56,8 +56,9 @@ _OLLAMA_URL        = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 _OLLAMA_MODEL      = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
 # Explicit override for large-input model (optional — auto-selected if blank)
 _OLLAMA_MODEL_LARGE = os.getenv("OLLAMA_MODEL_LARGE", "")
-# Character threshold above which the large model is selected (~120 lines of SQL)
-_LARGE_INPUT_THRESHOLD = 4000
+# Character threshold above which the large model is selected (~60 lines of SQL)
+# Lowered so multi-statement scripts (35+ statements) get the more capable 7b model
+_LARGE_INPUT_THRESHOLD = 2000
 
 # Priority list: best model for SQL code conversion → fallback order
 _MODEL_PRIORITY = [
@@ -404,34 +405,46 @@ def _chat_ollama(system_prompt: str, user_prompt: str, temperature: float) -> st
 
     # Dynamic context window: 1 token ≈ 4 chars (conservative estimate for SQL/code)
     input_tokens_est = total_input // 4
-    # Output budget: typically 50-70% of input size, capped at 6144 (covers 1000-line SPs)
-    output_budget = max(1200, min(6144, int(input_tokens_est * 0.65)))
+    # Output budget: scale with input size; extra headroom for multi-statement scripts.
+    # Each SQL statement generates ~15-25 output tokens (one spark.sql() call).
+    # Count ';' in the user_prompt as a proxy for number of statements.
+    stmt_count = max(1, user_prompt.count(";"))
+    stmt_budget = stmt_count * 30   # 30 tokens per statement, generous estimate
+    if is_large:
+        output_budget = max(stmt_budget, min(6144, int(input_tokens_est * 0.8)))
+    else:
+        output_budget = max(stmt_budget, min(3072, int(input_tokens_est * 0.8)))
+    output_budget = max(1200, output_budget)  # never below 1200
     # Round ctx up to next multiple of 2048 with a safety margin
     raw_ctx = input_tokens_est + output_budget + 256
-    num_ctx     = max(3072, min(32768, ((raw_ctx + 2047) // 2048) * 2048))
+    num_ctx     = max(2048, min(32768, ((raw_ctx + 2047) // 2048) * 2048))
     num_predict = output_budget
     # Scale timeout: assume ~7 tokens/sec worst-case on CPU, cap at 600s
-    timeout_s   = max(300, min(600, num_predict // 7))
+    timeout_s   = max(120, min(600, num_predict // 7))
 
     url = f"{_OLLAMA_URL}/api/chat"
     payload = json.dumps({
         "model": model,
+        "keep_alive": -1,   # keep model in RAM indefinitely — eliminates reload delay
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ],
         "options": {
-            "temperature":    0.1,    # slight randomness prevents copying example patterns
-            "seed":           42,     # reproducible output — no re-sampling variance
-            "top_k":          20,
+            "temperature":    0.15,   # slight randomness prevents premature EOS on multi-statement SQL
+            "seed":           42,     # reproducible output
+            "top_k":          20,     # wider beam — helps with long outputs
             "top_p":          0.9,
             "penalize_newline": False, # never penalise newlines in code output
-            "num_keep":       48,     # cache system-prompt prefix in KV across calls
+            "num_keep":       256,    # cache 256 system-prompt tokens in KV — speeds up repeat calls
             "num_predict":    num_predict,
             "num_ctx":        num_ctx,
-            "repeat_penalty": 1.15,  # higher → fewer repetitive code-loop artifacts
+            "repeat_penalty": 1.0,   # NO penalty — code needs repeated spark.sql() calls
             "num_thread":     os.cpu_count() or 8,
             "num_batch":      1024,
+            "num_gpu":        99,     # offload all layers to GPU if available (no-op on CPU-only)
+            "f16_kv":         True,   # half-precision KV cache → 2× smaller, faster attention
+            "use_mmap":       True,   # memory-map model weights → OS caches hot pages
         },
         "stream": False,
     }).encode("utf-8")
@@ -461,29 +474,39 @@ def _stream_ollama(system_prompt: str, user_prompt: str, temperature: float):
     model = _get_best_large_model() if is_large else _OLLAMA_MODEL
     # Same dynamic sizing as _chat_ollama
     input_tokens_est = total_input // 4
-    output_budget = max(1200, min(6144, int(input_tokens_est * 0.65)))
+    stmt_count = max(1, user_prompt.count(";"))
+    stmt_budget = stmt_count * 30
+    if is_large:
+        output_budget = max(stmt_budget, min(6144, int(input_tokens_est * 0.8)))
+    else:
+        output_budget = max(stmt_budget, min(3072, int(input_tokens_est * 0.8)))
+    output_budget = max(1200, output_budget)
     raw_ctx     = input_tokens_est + output_budget + 256
-    num_ctx     = max(3072, min(32768, ((raw_ctx + 2047) // 2048) * 2048))
+    num_ctx     = max(2048, min(32768, ((raw_ctx + 2047) // 2048) * 2048))
     num_predict = output_budget
     url = f"{_OLLAMA_URL}/api/chat"
     payload = json.dumps({
         "model": model,
+        "keep_alive": -1,   # keep model in RAM indefinitely — eliminates reload delay
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ],
         "options": {
-            "temperature":    0.1,
+            "temperature":    0.15,   # slight randomness prevents premature EOS
             "seed":           42,
             "top_k":          20,
             "top_p":          0.9,
             "penalize_newline": False,
-            "num_keep":       48,
+            "num_keep":       256,    # cache 256 system-prompt tokens in KV
             "num_predict":    num_predict,
             "num_ctx":        num_ctx,
-            "repeat_penalty": 1.15,
+            "repeat_penalty": 1.0,   # NO penalty — code needs repeated spark.sql() calls
             "num_thread":     os.cpu_count() or 8,
             "num_batch":      1024,
+            "num_gpu":        99,     # offload all layers to GPU if available (no-op on CPU-only)
+            "f16_kv":         True,   # half-precision KV cache → 2× smaller, faster attention
+            "use_mmap":       True,   # memory-map model weights → OS caches hot pages
         },
         "stream": True,
     }).encode("utf-8")
@@ -563,69 +586,33 @@ def _chat(system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str
 # ── System prompts ────────────────────────────────────────────────────────────
 
 _CONVERT_SYSTEM = textwrap.dedent("""\
-    You are an expert SQL-to-PySpark SQL converter. Output ONLY valid Python code. No markdown fences, no explanations.
+    SQL-to-PySpark SQL converter. Output ONLY valid Python. No markdown fences, no prose.
 
-    CORE RULES — apply to EVERY conversion:
-    1. First line must be an import or a function definition. Never output backticks or code fences.
-    2. Use spark.sql("...") for ALL SQL statements — SELECT, INSERT, UPDATE, DELETE, MERGE, CTEs, DDL.
-       Never use DataFrame API chains (.join(), .filter(), .groupBy(), .select()).
-    3. Temp tables: #tempname → spark.sql("CREATE OR REPLACE TEMP VIEW tempname AS SELECT ...")
-    4. Stored procedure params → typed Python function args (e.g. customer_id: int = None).
-    5. IF/ELSE control flow → Python if/elif/else blocks with spark.sql() calls inside.
-    6. WHILE loops → Python while loops with spark.sql() inside; never loop over .collect().
-    7. CURSORS → replace with a single bulk spark.sql() operation (UPDATE/INSERT/DELETE).
-       Always add: # NOTE: SQL cursor replaced with bulk Spark SQL operation
-    8. Transactions (BEGIN/COMMIT/ROLLBACK) → remove; add # NOTE: Transaction replaced by Delta ACID.
-    9. Function naming:
-        - Stored procedure: keep the SP name as snake_case: def usp_my_proc(spark, ...)
-        - Plain SQL query: descriptive name WITHOUT usp_/sp_ prefix: def get_orders(spark)
-    10. Wrap all logic in: def <name>(spark: SparkSession, <params>) -> DataFrame:
-    11. Do NOT add .show() inside the function. Production code never displays data.
-    12. Return the last meaningful DataFrame as result_df.
-    13. Only import logging and define logger if you actually call logger.info()/logger.warning().
-    14. DYNAMIC SQL (EXEC sp_executesql / EXEC @sql) → build with Python f-string, call spark.sql(f"...")
-    15. FOR JSON PATH → use result_df.toPandas().to_json(orient='records') or spark.sql() with to_json()
-    16. OBJECT_NAME(@@PROCID) → use the literal function name string
-    17. SCOPE_IDENTITY() → omit or use spark.sql("SELECT max(id) FROM ...").first()[0]
-    18. TRY/CATCH → Python try/except; re-raise with raise
-    19. THROW → raise ValueError("message")
-    20. SYSDATETIME() / GETDATE() → use Python: from datetime import datetime; datetime.now()
+    RULES (apply to every conversion):
+    1. spark.sql("...") for ALL SQL (SELECT/INSERT/UPDATE/DELETE/MERGE/DDL/CTEs). Never DataFrame API.
+    2. ONE function only — wrap ALL statements inside a SINGLE Python function. Never split into multiple functions.
+       Write ALL spark.sql() calls in sequence BEFORE writing `return result_df`. Never write `return` early.
+    3. #temp tables → spark.sql("CREATE OR REPLACE TEMP VIEW temp AS SELECT ...")
+    4. IF/ELSE → Python if/elif/else. WHILE → Python while. Never .collect() in loops.
+    5. CURSOR → single bulk spark.sql(). Add: # NOTE: cursor replaced with bulk Spark SQL
+    6. BEGIN/COMMIT/ROLLBACK → remove. Add: # NOTE: Transaction replaced by Delta ACID
+    7. No .show(). Return the last meaningful SELECT result as result_df.
+    8. Function naming:
+       - Stored procedure → keep SP name as snake_case: def usp_my_proc(spark, ...)
+       - Plain SQL script → descriptive name WITHOUT usp_/sp_ prefix: def process_employees(spark)
+    9. Stored procedure params → typed Python args: def fn(spark: SparkSession, param: int = None)
+    10. T-SQL→Spark SQL inside spark.sql(): ISNULL→COALESCE, LEN→LENGTH, GETDATE()→CURRENT_TIMESTAMP(),
+        TOP n→LIMIT n, DATEDIFF(u,s,e)→DATEDIFF(e,s), CONVERT→CAST, WITH(NOLOCK)→remove,
+        STRING_AGG→CONCAT_WS+COLLECT_LIST, EXEC @sql→spark.sql(f"..."), TRY/CATCH→try/except.
 
-    REQUIRED OUTPUT STRUCTURE:
-      from pyspark.sql import SparkSession, DataFrame
-      # (only add logging import if logger is actually used)
-
-      def <function_name>(spark: SparkSession, <typed_params>) -> DataFrame:
-          # --- convert ALL SQL operations here using spark.sql("...") ---
-          # --- convert ALL temp tables to TEMP VIEW ---
-          # --- convert ALL control flow to Python if/while ---
-          return result_df
-
-    PLAIN QUERY EXAMPLE (for reference only — do NOT copy for stored procedures):
-    Input:  SELECT order_id, total FROM orders WHERE region = 'APAC'
-    Output:
-      from pyspark.sql import SparkSession, DataFrame
-      def get_apac_orders(spark: SparkSession) -> DataFrame:
-          result_df = spark.sql("SELECT order_id, total FROM orders WHERE region = 'APAC'")
-          return result_df
-
-    T-SQL → SPARK SQL FUNCTION TRANSLATIONS (apply inside every spark.sql("...") string):
-      ISNULL(x, y)              → COALESCE(x, y)
-      LEN(col)                  → LENGTH(col)
-      GETDATE()                 → CURRENT_TIMESTAMP()
-      GETUTCDATE()              → UTC_TIMESTAMP()
-      CHARINDEX(sub, str)       → LOCATE(sub, str)
-      CONVERT(type, col)        → CAST(col AS type)
-      DATEDIFF(unit, start, end)→ DATEDIFF(end, start)   ← ARGS REVERSED in Spark!
-      TOP n                     → LIMIT n  (move to end of SELECT)
-      WITH (NOLOCK)             → remove entirely
-      STRING_AGG(col, delim)    → CONCAT_WS(delim, COLLECT_LIST(col))
-      RAISERROR(msg, …)         → raise ValueError(msg)
-      MERGE INTO (T-SQL syntax) → keep as-is — Spark SQL 3.0+ supports MERGE INTO
-      PIVOT / UNPIVOT           → SUM(CASE WHEN col='v' THEN val_col END) AS alias
-      OFFSET x ROWS FETCH NEXT y ROWS ONLY → LIMIT y OFFSET x
-
-    Now convert the SQL provided in the user message. Output ONLY the Python code — nothing else.
+    REQUIRED STRUCTURE — ONE function, ALL statements inside it:
+    from pyspark.sql import SparkSession, DataFrame
+    def process_data(spark: SparkSession) -> DataFrame:
+        spark.sql("CREATE TABLE ...")
+        spark.sql("INSERT INTO ...")
+        spark.sql("UPDATE ...")
+        result_df = spark.sql("SELECT ...")   # last SELECT is result_df
+        return result_df
 """)
 
 _EXPLAIN_SYSTEM = textwrap.dedent("""\
@@ -708,6 +695,12 @@ def _build_convert_user_prompt(sql: str, db_prefix: str, dialect: str) -> str:
     from converter.sql_preprocessor import preprocess
     pre = preprocess(sql)
 
+    # Count SQL statements so we can tell the model exactly how many
+    # spark.sql() calls to generate — prevents premature EOS
+    raw_stmts = [s.strip() for s in pre.cleaned_sql.split(";")
+                 if s.strip() and not s.strip().startswith("--")]
+    stmt_count = max(1, len(raw_stmts))
+
     hint_lines = ""
     if pre.is_stored_procedure:
         hint_lines += f"  - Stored procedure name : {pre.sp_name}\n"
@@ -721,16 +714,188 @@ def _build_convert_user_prompt(sql: str, db_prefix: str, dialect: str) -> str:
         hint_lines += f"  - Temp tables detected  : {', '.join(pre.temp_tables)}\n"
     if pre.dialect_hints:
         hint_lines += f"  - Complexity flags      : {', '.join(pre.dialect_hints)}\n"
+    hint_lines += f"  - SQL statements        : {stmt_count} (your function MUST contain exactly {stmt_count} spark.sql() calls)\n"
 
     context_block = f"\nSQL Context:\n{hint_lines}" if hint_lines else ""
+
+    # For multi-statement SQL, number each statement so the model
+    # iterates through every one rather than stopping after the first few
+    if stmt_count > 3:
+        sql_body = "\n".join(
+            f"[{i+1}/{stmt_count}] {s};" for i, s in enumerate(raw_stmts)
+        )
+    else:
+        sql_body = pre.cleaned_sql
+
     return textwrap.dedent(f"""\
         Database prefix for permanent tables: \"{db_prefix}\"
         {context_block}
-        SQL to convert:
+        SQL to convert ({stmt_count} statements — convert ALL of them):
         ---
-        {pre.cleaned_sql}
+        {sql_body}
         ---
     """), pre
+
+
+def _direct_convert_statements(pre, db_prefix: str, original_sql: str = "") -> str:
+    """Convert a plain SQL script directly to PySpark code — no LLM needed."""
+    import re as _re
+    import html as _html
+
+    source_sql = original_sql if original_sql.strip() else pre.cleaned_sql
+
+    # ── Parse: split on semicolons, keep preceding comment block per stmt ──
+    segments = []            # list of (comment_lines, sql_stmt_text)
+    pending_comments = []
+    current_stmt_lines = []
+
+    for raw_line in source_sql.split("\n"):
+        stripped = raw_line.strip()
+        if stripped.startswith("--"):
+            if current_stmt_lines:
+                s = " ".join(" ".join(current_stmt_lines).split()).strip()
+                if s:
+                    segments.append((list(pending_comments), s))
+                current_stmt_lines = []
+                pending_comments = []
+            pending_comments.append(stripped[2:].strip())
+        elif ";" in stripped:
+            before, _, _ = raw_line.partition(";")
+            current_stmt_lines.append(before)
+            s = " ".join(" ".join(current_stmt_lines).split()).strip()
+            if s:
+                segments.append((list(pending_comments), s))
+            current_stmt_lines = []
+            pending_comments = []
+        else:
+            current_stmt_lines.append(raw_line)
+
+    if current_stmt_lines:
+        s = " ".join(" ".join(current_stmt_lines).split()).strip()
+        if s:
+            segments.append((list(pending_comments), s))
+
+    if not segments:
+        return None
+
+    # ── Determine function name ────────────────────────────────────────────
+    func_name = pre.sp_name or ""
+    if not func_name:
+        first_sql = segments[0][1]
+        m = _re.search(r"\b(?:FROM|INTO|TABLE|VIEW)\s+(\w+)", first_sql, _re.IGNORECASE)
+        func_name = f"process_{m.group(1).lower()}" if m else "process_data"
+    func_name = _re.sub(r"[^a-z0-9_]", "_", func_name.lower()).strip("_") or "process_data"
+
+    # ── T-SQL → Spark SQL translations ────────────────────────────────────
+    def _translate(stmt: str) -> str:
+        # Fix any HTML entities (&gt; → >, &lt; → <, &amp; → &, etc.)
+        stmt = _html.unescape(stmt)
+        # SELECT TOP n → LIMIT n
+        top_m = _re.search(r"\bSELECT\s+TOP\s+(\d+)\b", stmt, _re.IGNORECASE)
+        if top_m:
+            n = top_m.group(1)
+            stmt = _re.sub(r"\bTOP\s+\d+\b\s*", "", stmt, flags=_re.IGNORECASE)
+            stmt = stmt.rstrip() + f" LIMIT {n}"
+        stmt = _re.sub(r"\bWITH\s*\(\s*NOLOCK\s*\)", "", stmt, flags=_re.IGNORECASE)
+        stmt = _re.sub(r"\bISNULL\s*\(", "COALESCE(", stmt, flags=_re.IGNORECASE)
+        stmt = _re.sub(r"\bLEN\s*\(", "LENGTH(", stmt, flags=_re.IGNORECASE)
+        stmt = _re.sub(r"\bGETDATE\s*\(\s*\)", "CURRENT_TIMESTAMP()", stmt, flags=_re.IGNORECASE)
+        stmt = _re.sub(r"\bGETUTCDATE\s*\(\s*\)", "UTC_TIMESTAMP()", stmt, flags=_re.IGNORECASE)
+        stmt = _re.sub(r"\bCHARINDEX\s*\(", "LOCATE(", stmt, flags=_re.IGNORECASE)
+        # CREATE VIEW X AS → CREATE OR REPLACE TEMP VIEW X AS
+        stmt = _re.sub(r"\bCREATE\s+VIEW\b", "CREATE OR REPLACE TEMP VIEW",
+                       stmt, flags=_re.IGNORECASE)
+        # CREATE TABLE → CREATE TABLE IF NOT EXISTS (safe for re-runs)
+        stmt = _re.sub(r"\bCREATE\s+TABLE\b(?!\s+IF)",
+                       "CREATE TABLE IF NOT EXISTS", stmt, flags=_re.IGNORECASE)
+        # Strip PRIMARY KEY constraint (not supported in Spark DDL)
+        stmt = _re.sub(r"\s+PRIMARY\s+KEY\b", "", stmt, flags=_re.IGNORECASE)
+        # VARCHAR(n) → STRING  (more portable across Spark/Delta)
+        stmt = _re.sub(r"\bVARCHAR\s*\(\s*\d+\s*\)", "STRING", stmt, flags=_re.IGNORECASE)
+        # DECIMAL(p,s) → DECIMAL(p,s)  — already valid, keep as-is
+        return " ".join(stmt.split())
+
+    # ── Group consecutive INSERTs to the same table into one multi-row INSERT ──
+    def _group_inserts(segs):
+        out = []
+        i = 0
+        while i < len(segs):
+            comments, stmt = segs[i]
+            ins_m = _re.match(
+                r"INSERT\s+INTO\s+(\w+)\s+VALUES\s*\((.+)\)$", stmt, _re.IGNORECASE | _re.DOTALL
+            )
+            if ins_m:
+                table = ins_m.group(1)
+                values = [ins_m.group(2)]
+                j = i + 1
+                while j < len(segs):
+                    _, nxt = segs[j]
+                    nxt_m = _re.match(
+                        r"INSERT\s+INTO\s+(\w+)\s+VALUES\s*\((.+)\)$",
+                        nxt, _re.IGNORECASE | _re.DOTALL
+                    )
+                    if nxt_m and nxt_m.group(1).lower() == table.lower():
+                        values.append(nxt_m.group(2))
+                        j += 1
+                    else:
+                        break
+                if len(values) > 1:
+                    rows = ",\n        ".join(f"({v})" for v in values)
+                    combined = f"INSERT INTO {table} VALUES\n        {rows}"
+                    out.append((comments, combined))
+                    i = j
+                    continue
+            out.append((comments, stmt))
+            i += 1
+        return out
+
+    # Translate all statements first, then group INSERTs
+    translated_segments = [(c, _translate(s)) for c, s in segments]
+    translated_segments = _group_inserts(translated_segments)
+
+    # ── Build function body ────────────────────────────────────────────────
+    code_lines = [
+        "from pyspark.sql import SparkSession, DataFrame",
+        "",
+        f"def {func_name}(spark: SparkSession) -> DataFrame:",
+    ]
+
+    has_select = False
+    for comments, stmt in translated_segments:
+        if not stmt:
+            continue
+
+        for c in comments:
+            if c:
+                code_lines.append(f"    # {c}")
+
+        is_select = bool(_re.match(r"SELECT\b", stmt, _re.IGNORECASE))
+        is_update = bool(_re.match(r"UPDATE\b", stmt, _re.IGNORECASE))
+        is_delete = bool(_re.match(r"DELETE\b", stmt, _re.IGNORECASE))
+        safe = stmt.replace('"""', '"\\"')
+
+        if is_update:
+            code_lines.append("    # NOTE: UPDATE requires a Delta table")
+            code_lines.append(f'    spark.sql("""{safe}""")')
+        elif is_delete:
+            code_lines.append("    # NOTE: DELETE requires a Delta table")
+            code_lines.append(f'    spark.sql("""{safe}""")')
+        elif is_select:
+            has_select = True
+            code_lines.append(f'    result_df = spark.sql("""{safe}""")')
+        else:
+            code_lines.append(f'    spark.sql("""{safe}""")')
+
+        if comments:
+            code_lines.append("")
+
+    if not has_select:
+        code_lines.append('    result_df = spark.sql("SELECT 1 AS result")')
+    code_lines.append("    return result_df")
+
+    return "\n".join(code_lines)
+
+
 
 
 def convert_sql_with_ai(
@@ -738,40 +903,31 @@ def convert_sql_with_ai(
     db_prefix: str = "my_db",
     dialect: str = "T-SQL",
 ) -> str:
+    """Convert SQL to PySpark SQL using the 3-stage pipeline.
+
+    For plain SQL scripts with 5+ statements (no stored procedure / cursors),
+    uses direct statement-by-statement conversion — fully complete and instant.
+    For stored procedures and complex SQL, uses the LLM pipeline.
     """
-    Convert SQL to PySpark SQL using the 3-stage pipeline:
-
-      Stage 1 — Preprocess  : core/preprocessor.py
-        Clean T-SQL noise (GO, USE, brackets), extract SP name / params / hints.
-
-      Stage 2 — LLM          : Ollama / other provider
-        Send cleaned SQL with a structured prompt enriched by metadata.
-
-      Stage 3 — Postprocess  : core/postprocessor.py
-        Strip fences, validate Python AST, inject missing imports, dedup.
-
-    Args:
-        sql:       Raw SQL text (T-SQL / ANSI SQL / PL/pgSQL / etc.)
-        db_prefix: Databricks catalog/database prefix for permanent tables
-        dialect:   SQL dialect hint (e.g. 'T-SQL', 'PostgreSQL', 'ANSI')
-
-    Returns:
-        Generated PySpark SQL Python source code as a string.
-
-    Raises:
-        RuntimeError: if no AI provider is configured or the API call fails.
-    """
-    # Stage 1 + prompt build (shared with streaming path)
-    user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
-
-    # ── Stage 2: LLM ────────────────────────────────────────────────────────
-    raw_output = _chat(_CONVERT_SYSTEM, user_prompt)
-
-    # ── Stage 3: Postprocess ─────────────────────────────────────────────────
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from converter.sql_preprocessor import preprocess
     from converter.code_postprocessor import postprocess
-    result = postprocess(raw_output)
 
-    # Return the validated code; if syntax is invalid, still return best-effort
+    pre = preprocess(sql)
+    raw_stmts = [s.strip() for s in pre.cleaned_sql.split(";")
+                 if s.strip() and not s.strip().startswith("--")]
+
+    # Direct conversion for plain SQL scripts (reliable, complete, instant)
+    if not pre.is_stored_procedure and len(raw_stmts) >= 5:
+        direct = _direct_convert_statements(pre, db_prefix, original_sql=sql)
+        if direct:
+            result = postprocess(direct)
+            return result.code
+
+    # LLM pipeline for stored procedures and complex SQL
+    user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
+    raw_output = _chat(_CONVERT_SYSTEM, user_prompt)
+    result = postprocess(raw_output)
     return result.code
 
 
@@ -780,22 +936,29 @@ def stream_sql_with_ai(
     db_prefix: str = "my_db",
     dialect: str = "T-SQL",
 ):
+    """Stream SQL → PySpark conversion. For plain scripts uses direct conversion
+    (single chunk, instant). For complex SQL streams LLM tokens live.
     """
-    Stream SQL → PySpark SQL conversion token-by-token (generator).
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from converter.sql_preprocessor import preprocess
 
-    Only supported for the Ollama provider (local streaming).
-    Falls back to a single-chunk yield for all other providers.
+    pre = preprocess(sql)
+    raw_stmts = [s.strip() for s in pre.cleaned_sql.split(";")
+                 if s.strip() and not s.strip().startswith("--")]
 
-    Yields:
-        str chunks as the model generates them.
-    """
-    # Use the same enriched, preprocessed prompt as the batch path
+    # Direct conversion for plain SQL scripts
+    if not pre.is_stored_procedure and len(raw_stmts) >= 5:
+        direct = _direct_convert_statements(pre, db_prefix, original_sql=sql)
+        if direct:
+            yield direct
+            return
+
+    # LLM streaming for stored procedures / complex SQL
     user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
     provider = _detect_provider()
     if provider == "ollama":
-        yield from _stream_ollama(_CONVERT_SYSTEM, user_prompt, temperature=0.0)
+        yield from _stream_ollama(_CONVERT_SYSTEM, user_prompt, temperature=0.15)
     else:
-        # Non-streaming fallback: yield the full result as one chunk
         yield _clean_ai_output(_chat(_CONVERT_SYSTEM, user_prompt))
 
 
