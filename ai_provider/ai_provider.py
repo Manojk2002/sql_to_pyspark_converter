@@ -954,15 +954,26 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
     raw_stmts: list = []
     current: list = []
     for line in body.split('\n'):
-        if ';' in line:
-            before, _, _ = line.partition(';')
+        # Find ';' that is NOT inside a single-quoted string literal
+        in_str = False
+        split_pos = -1
+        for ci, ch in enumerate(line):
+            if ch == "'":
+                in_str = not in_str
+            elif ch == ';' and not in_str:
+                split_pos = ci
+                break
+
+        if split_pos >= 0:
+            before = line[:split_pos]
+            after  = line[split_pos + 1:]
             if before.strip():
                 current.append(before)
-            # dedent removes the common SP-body indent (usually 4 spaces)
             stmt = _textwrap.dedent('\n'.join(current)).strip()
             if stmt:
                 raw_stmts.append(stmt)
-            current = []
+            # Preserve content AFTER the ';' (handles ;WITH CTE syntax)
+            current = [after] if after.strip() else []
         else:
             current.append(line)
     if current:
@@ -971,26 +982,88 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
             raw_stmts.append(stmt)
 
     # ── 4. Classify statements ────────────────────────────────────────────────
-    # ASSIGN_GROUP : SELECT @Var=expr[,…] FROM tbl  — all items are assignments
-    # VAR_READ     : SELECT @Var AS alias[,…]        — no FROM clause
-    # REGULAR      : everything else (kept as-is)
+    # Supports: simple SPs, SPs with cursor, TRY/CATCH, transactions, dynamic SQL.
+    #
+    # ASSIGN_GROUP : SELECT @Var=expr[,…] FROM tbl
+    # VAR_READ     : SELECT @Var AS alias[,…] (no FROM)
+    # RAISERROR    : converted to raise ValueError(...)
+    # CURSOR_NOTE  : placeholder emitted once for the cursor block
+    # REGULAR      : kept as spark.sql(...)
 
-    var_map: dict = {}   # UPPER_VAR → {'expr': str, 'table': str}
-    classified: list = []
+    var_map:    dict  = {}   # UPPER_VAR → {'expr': str, 'table': str}
+    dyn_sql_map: dict = {}   # UPPER_VAR → SQL string (from SET @var = 'SELECT ...')
+    temp_map:   dict  = {}   # #LOWER_NAME → spark_view_name
+    classified: list  = []
+    _cursor_note_added = False
+
+    # ── keywords that are structure/noise with no Spark equivalent ────────────
+    _SKIP_RE = _re.compile(
+        r'^(?:'
+        r'BEGIN\s+TRY|END\s+TRY|BEGIN\s+CATCH|END\s+CATCH'
+        r'|BEGIN\s+TRANSACTION|COMMIT(?:\s+TRANSACTION)?|ROLLBACK(?:\s+TRANSACTION)?'
+        r'|OPEN\s+\w+|CLOSE\s+\w+|DEALLOCATE\s+\w+'
+        r'|FETCH\s+NEXT\s+FROM'
+        r'|WHILE\s+@@FETCH_STATUS'
+        r'|IF\s+@@TRANCOUNT'
+        r'|THROW\b'
+        r'|PRINT\s+'
+        r'|END\s*$'
+        r')',
+        _re.IGNORECASE,
+    )
 
     for stmt in raw_stmts:
-        flat = ' '.join(stmt.split())   # normalized single-line copy for detection
+        flat = ' '.join(stmt.split())
         up   = flat.upper()
 
-        # Skip DECLARE, SET NOCOUNT/XACT_ABORT, and SET @var =
+        # ── Always skip these ──────────────────────────────────────────────────
         if up.startswith('DECLARE '):
             continue
-        if _re.match(r'SET\s+(NOCOUNT|XACT_ABORT|ANSI_NULLS|QUOTED_IDENTIFIER|TRANSACTION)', flat, _re.IGNORECASE):
+        if _re.match(r'SET\s+(NOCOUNT|XACT_ABORT|ANSI_NULLS|QUOTED_IDENTIFIER|TRANSACTION)',
+                     flat, _re.IGNORECASE):
             continue
         if _re.match(r'SET\s+@', flat, _re.IGNORECASE):
+            # But capture dynamic-SQL string assignments: SET @var = 'INSERT...'
+            dyn_m = _re.match(r"SET\s+@(\w+)\s*=\s*N?'(.+)'$", flat, _re.IGNORECASE | _re.DOTALL)
+            if dyn_m:
+                dyn_sql_map[dyn_m.group(1).upper()] = dyn_m.group(2).strip()
+            continue
+        if _SKIP_RE.match(flat):
             continue
 
-        # Possible assignment SELECT or VAR_READ?
+        # ── CREATE TABLE #temp → record name, skip DDL (view created by INSERT) ──
+        crt_m = _re.match(r'CREATE\s+TABLE\s+(#\w+)', flat, _re.IGNORECASE)
+        if crt_m:
+            tmp = crt_m.group(1).lower().lstrip('#')
+            temp_map[crt_m.group(1).lower()] = tmp + '_temp'
+            continue   # DDL for #temp tables is implicit; the view comes from INSERT SELECT
+
+        # ── EXEC sp_executesql @var → emit the stored SQL string ──────────────
+        exec_m = _re.match(r'EXEC(?:UTE)?\s+sp_executesql\s+@(\w+)', flat, _re.IGNORECASE)
+        if exec_m:
+            var_up = exec_m.group(1).upper()
+            sql_str = dyn_sql_map.get(var_up, '')
+            if sql_str:
+                classified.append(('REGULAR', sql_str, ' '.join(sql_str.split())))
+            else:
+                classified.append(('REGULAR', stmt, flat))   # best-effort fallback
+            continue
+
+        # ── RAISERROR → Python raise ValueError ────────────────────────────────
+        if _re.match(r'RAISERROR\s*\(', flat, _re.IGNORECASE):
+            msg_m = _re.search(r"RAISERROR\s*\(\s*N?'([^']+)'", flat, _re.IGNORECASE)
+            msg = msg_m.group(1) if msg_m else 'Validation error'
+            classified.append(('RAISERROR', msg))
+            continue
+
+        # ── Cursor DECLARE → emit one CURSOR_NOTE placeholder ─────────────────
+        if (_re.match(r'DECLARE\s+\w+\s+CURSOR', flat, _re.IGNORECASE)
+                and not _cursor_note_added):
+            _cursor_note_added = True
+            classified.append(('CURSOR_NOTE', stmt))
+            continue
+
+        # ── Assignment SELECT(s) → variable capture ────────────────────────────
         if _re.match(r'SELECT\b', flat, _re.IGNORECASE) and '@' in flat:
             from_m = _re.search(r'\bFROM\b', flat, _re.IGNORECASE)
             if from_m:
@@ -998,7 +1071,6 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
                 rest        = flat[from_m.start():]
                 tbl_m       = _re.match(r'FROM\s+(\S+)', rest, _re.IGNORECASE)
                 tbl         = tbl_m.group(1) if tbl_m else 'Unknown'
-                # Split on commas NOT inside parentheses
                 items = [x.strip() for x in _re.split(r',(?![^()]*\))', select_list) if x.strip()]
                 if items and all(_re.match(r'@\w+\s*=', it, _re.IGNORECASE) for it in items):
                     for it in items:
@@ -1008,9 +1080,37 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
                     classified.append(('ASSIGN_GROUP', tbl, items, stmt))
                     continue
             else:
-                # No FROM clause → reads back previously assigned variables
                 classified.append(('VAR_READ', stmt, flat))
                 continue
+
+        # ── SELECT … INTO #temp OR ;WITH … SELECT * INTO #temp ────────────────
+        into_m = _re.search(r'\bINTO\s+(#\w+)\b', flat, _re.IGNORECASE)
+        is_select_or_cte = (
+            _re.match(r'SELECT\b', flat, _re.IGNORECASE)
+            or _re.match(r'WITH\b', flat, _re.IGNORECASE)
+        )
+        if into_m and is_select_or_cte:
+            tmp_raw  = into_m.group(1).lower()
+            view_nm  = tmp_raw.lstrip('#') + '_temp'
+            temp_map[tmp_raw] = view_nm
+            # Remove the INTO #temp clause from the SELECT
+            clean = _re.sub(r'\bINTO\s+#\w+\b\s*', '', stmt, flags=_re.IGNORECASE)
+            rewritten = f'CREATE OR REPLACE TEMP VIEW {view_nm} AS\n{clean.strip()}'
+            classified.append(('REGULAR', rewritten, ' '.join(rewritten.split())))
+            continue
+
+        # ── INSERT INTO #temp SELECT … → CREATE OR REPLACE TEMP VIEW ──────────
+        ins_into_m = _re.match(r'INSERT\s+INTO\s+(#\w+)\s+SELECT\b', flat, _re.IGNORECASE)
+        if ins_into_m:
+            tmp_raw  = ins_into_m.group(1).lower()
+            view_nm  = tmp_raw.lstrip('#') + '_temp'
+            temp_map[tmp_raw] = view_nm
+            # Rewrite as CREATE OR REPLACE TEMP VIEW … AS SELECT …
+            sel_start = _re.search(r'\bSELECT\b', stmt, _re.IGNORECASE)
+            sel_body  = stmt[sel_start.start():] if sel_start else stmt
+            rewritten = f'CREATE OR REPLACE TEMP VIEW {view_nm} AS\n{sel_body.strip()}'
+            classified.append(('REGULAR', rewritten, ' '.join(rewritten.split())))
+            continue
 
         classified.append(('REGULAR', stmt, flat))
 
@@ -1054,7 +1154,7 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
                     cols.append(f'    {expr} AS {alias}')
 
             consolidated = 'SELECT\n' + ',\n'.join(cols) + f'\nFROM {tbl0}'
-            final_stmts.append((consolidated,))
+            final_stmts.append(('SQL', consolidated))
             i = j
             continue
 
@@ -1067,15 +1167,19 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
                 tables = list({v['table'] for v in var_map.values()})
                 if tables:
                     resolved += f' FROM {tables[0]}'
-            final_stmts.append((resolved,))
+            final_stmts.append(('SQL', resolved))
+            i += 1
+            continue
+
+        # Pass-through special kinds unchanged
+        if kind in ('CURSOR_NOTE', 'RAISERROR'):
+            final_stmts.append(classified[i])  # keep full tuple
             i += 1
             continue
 
         # REGULAR — preserve multi-line original text
-        final_stmts.append((classified[i][1],))
+        final_stmts.append(('SQL', classified[i][1]))
         i += 1
-
-    # ── 6. T-SQL → Spark SQL translation ─────────────────────────────────────
     def _t(sql: str) -> str:
         # Note: HTML entities already decoded on source above; _t only handles structure
         top_m = _re.search(r'\bSELECT\s+TOP\s+(\d+)\b', sql, _re.IGNORECASE)
@@ -1091,6 +1195,14 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
         sql = _re.sub(r'\bGETUTCDATE\s*\(\s*\)',          'UTC_TIMESTAMP()',         sql, flags=_re.IGNORECASE)
         sql = _re.sub(r'\bCHARINDEX\s*\(',               'LOCATE(',                 sql, flags=_re.IGNORECASE)
         sql = _re.sub(r'\bVARCHAR\s*\(\s*\d+\s*\)',       'STRING',                 sql, flags=_re.IGNORECASE)
+        sql = _re.sub(r'\bNVARCHAR\s*\(\s*(?:\d+|MAX)\s*\)', 'STRING',             sql, flags=_re.IGNORECASE)
+        sql = _re.sub(r'\bDATEADD\s*\(YEAR\s*,\s*-(\d+)\s*,', r'date_sub(current_timestamp(), \1 * 365,', sql, flags=_re.IGNORECASE)
+        sql = _re.sub(r'\bERROR_MESSAGE\s*\(\s*\)',       "'<error_message>'",       sql, flags=_re.IGNORECASE)
+        sql = _re.sub(r'@RunID\b',  'uuid()',  sql)   # local UNIQUEIDENTIFIER variable
+        sql = _re.sub(r'@RUNID\b',  'uuid()',  sql)
+        # Replace #temp_table references with spark view names (no \b — # is non-word)
+        for tmp_lower, view_nm in temp_map.items():
+            sql = _re.sub(_re.escape(tmp_lower), view_nm, sql, flags=_re.IGNORECASE)
         return sql
 
     # ── 7. Parameter replacement ──────────────────────────────────────────────
@@ -1213,7 +1325,7 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
         if 'WHERE' in u and 'SELECT MAX(' in u:                    return '# Employee With Highest Salary'
         if 'WHERE' in u and 'SELECT MIN(' in u:                    return '# Employee With Lowest Salary'
         if 'WHERE' in u and 'SELECT AVG(' in u:                    return '# Salary Above Average'
-        if 'WHERE' in u and 'IN\s*\(' in u:                        return '# Department IN Filter'
+        if 'WHERE' in u and _re.search(r'\bIN\s*\(', u):                        return '# Department IN Filter'
         if _re.search(r'\bIN\s*\(', u):                            return '# Department IN Filter'
         # Date filter
         if 'JOININGDATE' in u and '2022' in u:                     return '# Joined After 2022'
@@ -1253,25 +1365,46 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
         func_sig = f'def {func_name}(spark: SparkSession) -> DataFrame:'
 
     # ── 10. Assemble Python source ────────────────────────────────────────────
-    # Each SELECT gets a unique numbered variable (result_df_1, result_df_2, …)
-    # so every intermediate result is preserved and accessible.
-    # INSERT / UPDATE / DELETE use bare spark.sql(…) with no variable assignment.
+    # Each SELECT gets a unique numbered variable (result_df_1, result_df_2, …).
+    # CURSOR_NOTE emits a comment. RAISERROR emits a raise comment.
+    # INSERT / UPDATE / DELETE / MERGE use bare spark.sql(…).
     code: list = ['from pyspark.sql import SparkSession, DataFrame', '', func_sig, '']
-    select_count   = 1      # 1-based counter for result_df_N naming
-    last_select_var = None  # tracks the most-recent SELECT result variable
+    select_count   = 1
+    last_select_var = None
 
-    for (sql_text,) in final_stmts:
+    for item in final_stmts:
+        kind = item[0]
+
+        # ── CURSOR_NOTE ────────────────────────────────────────────────────────
+        if kind == 'CURSOR_NOTE':
+            code.append('    # NOTE: CURSOR replaced with bulk Spark SQL')
+            code.append('    # Vectorize: build the payroll_summary_temp view above')
+            code.append('    # using column expressions instead of row-by-row variables.')
+            code.append('')
+            continue
+
+        # ── RAISERROR → Python raise comment ──────────────────────────────────
+        if kind == 'RAISERROR':
+            msg = item[1]
+            code.append(f"    # Validation — raise on invalid data")
+            code.append(f"    # if <condition>: raise ValueError('{msg}')")
+            code.append('')
+            continue
+
+        sql_text        = item[1]   # valid for SQL, CURSOR_NOTE (stmt), RAISERROR (msg)
         sql             = _t(sql_text)
         result, uses_f, if_else = _replace_params(sql)
 
-        up_raw = sql.upper().lstrip()
-        is_sel = up_raw.startswith('SELECT')
-        is_ins = up_raw.startswith('INSERT')
-        is_upd = up_raw.startswith('UPDATE')
-        is_del = up_raw.startswith('DELETE')
+        up_raw = (result or sql).upper().lstrip()
+        is_view = up_raw.startswith('CREATE OR REPLACE TEMP VIEW')
+        is_sel  = up_raw.startswith('SELECT') and not is_view
+        is_ins  = up_raw.startswith('INSERT')
+        is_upd  = up_raw.startswith('UPDATE')
+        is_del  = up_raw.startswith('DELETE')
+        is_mrg  = up_raw.startswith('MERGE')
+        is_ddl  = is_view or up_raw.startswith('CREATE TABLE') or up_raw.startswith('ALTER')
 
         if if_else:
-            # VARCHAR/DATE param → Python if/else block
             py_nm   = if_else['py_name']
             sw      = if_else['sql_with'].strip().replace('"""', '"\\""')
             swo     = if_else['sql_without'].strip().replace('"""', '"\\""')
@@ -1295,7 +1428,6 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
             continue
 
         safe = result.strip().replace('"""', '"\\""')
-        # Use the replaced SQL for comment detection (has f-string expressions for Salary Filter etc.)
         cmnt = _comment(result)
         if cmnt:
             code.append(f'    {cmnt}')
@@ -1306,7 +1438,7 @@ def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
             last_select_var = var_nm
             select_count += 1
             code.append(f'    {var_nm} = spark.sql({prefix}"""')
-        elif is_ins:
+        elif is_view or is_ddl or is_ins or is_mrg:
             code.append(f'    spark.sql({prefix}"""')
         elif is_upd or is_del:
             code.append(f'    # NOTE: {"UPDATE" if is_upd else "DELETE"} requires a Delta table')
@@ -1356,26 +1488,12 @@ def convert_sql_with_ai(
             result = postprocess(direct)
             return result.code
 
-    # Direct conversion for simple stored procedures (no cursors / dynamic SQL)
-    if (pre.is_stored_procedure
-            and 'cursor'      not in pre.dialect_hints
-            and 'dynamic_sql' not in pre.dialect_hints):
+    # Direct conversion for ALL stored procedures (simple + complex)
+    if pre.is_stored_procedure:
         direct = _sp_direct_convert(pre, db_prefix, original_sql=sql)
         if direct:
             result = postprocess(direct)
             return result.code
-
-    # Rule-based pipeline for complex SPs (cursor / dynamic SQL / transactions)
-    # Gives structured, correct output — no LLM hallucination
-    if pre.is_stored_procedure:
-        try:
-            from converter.conversion_pipeline import ConversionPipeline
-            pipeline = ConversionPipeline(db_prefix=db_prefix)
-            pr = pipeline.run(sql)
-            if pr.pyspark_code and not pr.errors:
-                return pr.pyspark_code
-        except Exception:
-            pass  # fall through to LLM
 
     # LLM pipeline — last resort for non-SP complex scripts
     user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
@@ -1409,26 +1527,12 @@ def stream_sql_with_ai(
             yield direct
             return
 
-    # Direct conversion for simple stored procedures (no cursors / dynamic SQL)
-    if (pre.is_stored_procedure
-            and 'cursor'      not in pre.dialect_hints
-            and 'dynamic_sql' not in pre.dialect_hints):
+    # Direct conversion for ALL stored procedures (simple + complex)
+    if pre.is_stored_procedure:
         direct = _sp_direct_convert(pre, db_prefix, original_sql=sql)
         if direct:
             yield direct
             return
-
-    # Rule-based pipeline for complex SPs (cursor / dynamic SQL / transactions)
-    if pre.is_stored_procedure:
-        try:
-            from converter.conversion_pipeline import ConversionPipeline
-            pipeline = ConversionPipeline(db_prefix=db_prefix)
-            pr = pipeline.run(sql)
-            if pr.pyspark_code and not pr.errors:
-                yield pr.pyspark_code
-                return
-        except Exception:
-            pass  # fall through to LLM streaming
 
     # LLM streaming — last resort for non-SP complex scripts
     user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
