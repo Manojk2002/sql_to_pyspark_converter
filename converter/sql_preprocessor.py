@@ -59,7 +59,7 @@ _SP_HEADER = re.compile(
 )
 _SP_PARAM = re.compile(
     r"(@[\w]+)\s+(?:AS\s+)?(\w+(?:\s+\w+)?)(?:\([^)]*\))?"
-    r"(?:\s*=\s*([^,\n@]+?))?(?:\s+(?:OUT(?:PUT)?|READONLY))?\s*(?=,|@|AS\s+BEGIN|BEGIN|$)",
+    r"(?:\s*=\s*([^,\n@]+?))?(?:\s+(?:OUT(?:PUT)?|READONLY))?\s*(?=,|@|AS\s+BEGIN|BEGIN|\s*\)|$)",
     re.IGNORECASE,
 )
 

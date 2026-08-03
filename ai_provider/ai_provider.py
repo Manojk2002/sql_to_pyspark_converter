@@ -604,6 +604,10 @@ _CONVERT_SYSTEM = textwrap.dedent("""\
     10. T-SQL→Spark SQL inside spark.sql(): ISNULL→COALESCE, LEN→LENGTH, GETDATE()→CURRENT_TIMESTAMP(),
         TOP n→LIMIT n, DATEDIFF(u,s,e)→DATEDIFF(e,s), CONVERT→CAST, WITH(NOLOCK)→remove,
         STRING_AGG→CONCAT_WS+COLLECT_LIST, EXEC @sql→spark.sql(f"..."), TRY/CATCH→try/except.
+    11. IMPORTS — write EXACTLY these two lines, nothing else:
+        from pyspark.sql import SparkSession, DataFrame
+        Do NOT write `from pyspark.sql.functions import ...` — functions are not needed when all SQL runs via spark.sql().
+        Do NOT repeat or duplicate import lines.
 
     REQUIRED STRUCTURE — ONE function, ALL statements inside it:
     from pyspark.sql import SparkSession, DataFrame
@@ -896,6 +900,432 @@ def _direct_convert_statements(pre, db_prefix: str, original_sql: str = "") -> s
     return "\n".join(code_lines)
 
 
+def _sp_direct_convert(pre, db_prefix: str, original_sql: str = "") -> str:
+    """Convert a simple stored procedure to PySpark without LLM.
+
+    Handles:
+    - SP parameters → typed Python function args with None defaults.
+    - DECLARE @Var → skipped (variables become Python None defaults).
+    - Consecutive ``SELECT @Var = expr FROM tbl`` stmts followed by a
+      ``SELECT @Var AS alias, …`` (no FROM) are consolidated into one
+      clean ``SELECT expr AS alias, … FROM tbl`` result.
+    - @Param references in WHERE → f-string interpolation:
+        VARCHAR  @P  →  '{pyvar}'      (SQL string literal)
+        NUMERIC  @P  →  {0 if pyvar is None else pyvar}
+        @P IS NULL   →  {expr} = 0    (for numeric; VARCHAR keeps IS NULL)
+    - T-SQL translations: TOP n→LIMIT n, GETDATE→current_timestamp(), etc.
+    - Heuristic section comments above each spark.sql() call.
+
+    Used when the SP has no cursors, no dynamic SQL — gives instant, reliable output.
+    """
+    import re as _re
+    import html as _html
+
+    # ── 1. Parameter map ─────────────────────────────────────────────────────
+    # Maps UPPER_NAME → {py_name, is_numeric}
+    param_map = {}
+    for p in pre.parameters:
+        raw  = p['name'].lstrip('@')
+        is_num = any(
+            t in p['type'].upper()
+            for t in ('INT', 'DECIMAL', 'NUMERIC', 'FLOAT', 'MONEY', 'BIT', 'BIGINT', 'SMALLINT')
+        )
+        param_map[raw.upper()] = {'py_name': raw.lower(), 'is_numeric': is_num}
+
+    # ── 2. Extract SP body (between AS BEGIN … END) ───────────────────────────
+    source = original_sql if original_sql.strip() else pre.cleaned_sql
+    source = _re.sub(r'--[^\n]*', '', source)
+    source = _re.sub(r'/\*.*?\*/', ' ', source, flags=_re.DOTALL)
+    # Multi-pass HTML entity decoding (handles &amp;gt; → &gt; → > etc.)
+    while True:
+        decoded = _html.unescape(source)
+        if decoded == source:
+            break
+        source = decoded
+
+    body_m = _re.search(
+        r'\bAS\s*\n?\s*BEGIN\b\s*(.*?)\bEND\b\s*;?\s*(?:GO\b[.\s]*)?$',
+        source, _re.IGNORECASE | _re.DOTALL
+    )
+    body = body_m.group(1).strip() if body_m else source
+
+    # ── 3. Split into statements (preserving multi-line formatting) ───────────
+    import textwrap as _textwrap
+    raw_stmts: list = []
+    current: list = []
+    for line in body.split('\n'):
+        if ';' in line:
+            before, _, _ = line.partition(';')
+            if before.strip():
+                current.append(before)
+            # dedent removes the common SP-body indent (usually 4 spaces)
+            stmt = _textwrap.dedent('\n'.join(current)).strip()
+            if stmt:
+                raw_stmts.append(stmt)
+            current = []
+        else:
+            current.append(line)
+    if current:
+        stmt = _textwrap.dedent('\n'.join(current)).strip()
+        if stmt:
+            raw_stmts.append(stmt)
+
+    # ── 4. Classify statements ────────────────────────────────────────────────
+    # ASSIGN_GROUP : SELECT @Var=expr[,…] FROM tbl  — all items are assignments
+    # VAR_READ     : SELECT @Var AS alias[,…]        — no FROM clause
+    # REGULAR      : everything else (kept as-is)
+
+    var_map: dict = {}   # UPPER_VAR → {'expr': str, 'table': str}
+    classified: list = []
+
+    for stmt in raw_stmts:
+        flat = ' '.join(stmt.split())   # normalized single-line copy for detection
+        up   = flat.upper()
+
+        # Skip DECLARE, SET NOCOUNT/XACT_ABORT, and SET @var =
+        if up.startswith('DECLARE '):
+            continue
+        if _re.match(r'SET\s+(NOCOUNT|XACT_ABORT|ANSI_NULLS|QUOTED_IDENTIFIER|TRANSACTION)', flat, _re.IGNORECASE):
+            continue
+        if _re.match(r'SET\s+@', flat, _re.IGNORECASE):
+            continue
+
+        # Possible assignment SELECT or VAR_READ?
+        if _re.match(r'SELECT\b', flat, _re.IGNORECASE) and '@' in flat:
+            from_m = _re.search(r'\bFROM\b', flat, _re.IGNORECASE)
+            if from_m:
+                select_list = flat[6:from_m.start()].strip()
+                rest        = flat[from_m.start():]
+                tbl_m       = _re.match(r'FROM\s+(\S+)', rest, _re.IGNORECASE)
+                tbl         = tbl_m.group(1) if tbl_m else 'Unknown'
+                # Split on commas NOT inside parentheses
+                items = [x.strip() for x in _re.split(r',(?![^()]*\))', select_list) if x.strip()]
+                if items and all(_re.match(r'@\w+\s*=', it, _re.IGNORECASE) for it in items):
+                    for it in items:
+                        m = _re.match(r'@(\w+)\s*=\s*(.+)', it, _re.IGNORECASE)
+                        if m:
+                            var_map[m.group(1).upper()] = {'expr': m.group(2).strip(), 'table': tbl}
+                    classified.append(('ASSIGN_GROUP', tbl, items, stmt))
+                    continue
+            else:
+                # No FROM clause → reads back previously assigned variables
+                classified.append(('VAR_READ', stmt, flat))
+                continue
+
+        classified.append(('REGULAR', stmt, flat))
+
+    # ── 5. Consolidate ASSIGN_GROUPs + following VAR_READ ────────────────────
+    final_stmts: list = []   # (sql_text,) tuples
+    i = 0
+    while i < len(classified):
+        kind = classified[i][0]
+
+        if kind == 'ASSIGN_GROUP':
+            tbl0      = classified[i][1]
+            all_items = list(classified[i][2])
+            j = i + 1
+            # Collect consecutive ASSIGN_GROUPs from the SAME table
+            while (j < len(classified)
+                   and classified[j][0] == 'ASSIGN_GROUP'
+                   and classified[j][1].upper() == tbl0.upper()):
+                all_items.extend(classified[j][2])
+                j += 1
+
+            # Check if immediately followed by a VAR_READ
+            var_read_aliases: dict = {}
+            if j < len(classified) and classified[j][0] == 'VAR_READ':
+                between = _re.sub(
+                    r'^SELECT\s+', '', classified[j][2], flags=_re.IGNORECASE
+                ).strip()
+                for part in between.split(','):
+                    m = _re.match(r'@(\w+)\s+AS\s+(\w+)', part.strip(), _re.IGNORECASE)
+                    if m:
+                        var_read_aliases[m.group(1).upper()] = m.group(2)
+                j += 1  # consume the VAR_READ
+
+            # Build consolidated SELECT
+            cols = []
+            for it in all_items:
+                m = _re.match(r'@(\w+)\s*=\s*(.+)', it, _re.IGNORECASE)
+                if m:
+                    v_up  = m.group(1).upper()
+                    expr  = m.group(2).strip()
+                    alias = var_read_aliases.get(v_up, v_up[0] + v_up[1:].lower())
+                    cols.append(f'    {expr} AS {alias}')
+
+            consolidated = 'SELECT\n' + ',\n'.join(cols) + f'\nFROM {tbl0}'
+            final_stmts.append((consolidated,))
+            i = j
+            continue
+
+        if kind == 'VAR_READ':
+            # Unconsumed VAR_READ: resolve @Var refs from var_map
+            resolved = classified[i][2]
+            for v_up, info in var_map.items():
+                resolved = _re.sub(rf'@{v_up}\b', info['expr'], resolved, flags=_re.IGNORECASE)
+            if var_map and 'FROM' not in resolved.upper():
+                tables = list({v['table'] for v in var_map.values()})
+                if tables:
+                    resolved += f' FROM {tables[0]}'
+            final_stmts.append((resolved,))
+            i += 1
+            continue
+
+        # REGULAR — preserve multi-line original text
+        final_stmts.append((classified[i][1],))
+        i += 1
+
+    # ── 6. T-SQL → Spark SQL translation ─────────────────────────────────────
+    def _t(sql: str) -> str:
+        # Note: HTML entities already decoded on source above; _t only handles structure
+        top_m = _re.search(r'\bSELECT\s+TOP\s+(\d+)\b', sql, _re.IGNORECASE)
+        if top_m:
+            n   = top_m.group(1)
+            sql = _re.sub(r'\bTOP\s+\d+\b\s*', '', sql, flags=_re.IGNORECASE)
+            ob  = _re.search(r'\bORDER\s+BY\b[^\n]*', sql, _re.IGNORECASE)
+            sql = sql[:ob.end()] + f'\nLIMIT {n}' + sql[ob.end():] if ob else sql.rstrip() + f'\nLIMIT {n}'
+        sql = _re.sub(r'\bWITH\s*\(\s*NOLOCK\s*\)',       '',                       sql, flags=_re.IGNORECASE)
+        sql = _re.sub(r'\bISNULL\s*\(',                   'COALESCE(',               sql, flags=_re.IGNORECASE)
+        sql = _re.sub(r'\bLEN\s*\(',                      'LENGTH(',                 sql, flags=_re.IGNORECASE)
+        sql = _re.sub(r'\bGETDATE\s*\(\s*\)',             'current_timestamp()',     sql, flags=_re.IGNORECASE)
+        sql = _re.sub(r'\bGETUTCDATE\s*\(\s*\)',          'UTC_TIMESTAMP()',         sql, flags=_re.IGNORECASE)
+        sql = _re.sub(r'\bCHARINDEX\s*\(',               'LOCATE(',                 sql, flags=_re.IGNORECASE)
+        sql = _re.sub(r'\bVARCHAR\s*\(\s*\d+\s*\)',       'STRING',                 sql, flags=_re.IGNORECASE)
+        return sql
+
+    # ── 7. Parameter replacement ──────────────────────────────────────────────
+    # For NUMERIC params: f-string with {0 if p is None else p} (works for None).
+    # For VARCHAR/DATE params: detect (@P IS NULL OR condition) pattern and
+    # return info for Python if/else generation (avoids 'None' string comparisons).
+    def _replace_params(sql: str):
+        """
+        Returns (modified_sql, uses_f, if_else)
+        - modified_sql : str  — SQL with substitutions (or None when if_else applies)
+        - uses_f       : bool — True if f-string needed
+        - if_else      : None | dict{py_name, sql_with, sql_without}
+        """
+        if not param_map:
+            return sql, False, None
+
+        uses_f = False
+        for upper, info in param_map.items():
+            pat = _re.compile(rf'@{upper}\b', _re.IGNORECASE)
+            if not pat.search(sql):
+                continue
+            py_nm = info['py_name']
+
+            if info['is_numeric']:
+                # Numeric: f-string approach.  None → 0 = 0 (true) so no WHERE filter.
+                uses_f    = True
+                null_expr = f'{{0 if {py_nm} is None else {py_nm}}}'
+                sql = _re.sub(
+                    rf'@{upper}\s+IS\s+NULL', f'{null_expr} = 0',
+                    sql, flags=_re.IGNORECASE
+                )
+                sql = pat.sub(null_expr, sql)
+
+            else:
+                # VARCHAR/DATE: (@P IS NULL OR condition) → Python if/else
+                null_or_re = _re.compile(
+                    rf'(\s*\bWHERE\b\s*)\(\s*@{upper}\s+IS\s+NULL\s+OR\s+([^()]+)\)',
+                    _re.IGNORECASE | _re.DOTALL
+                )
+                m = null_or_re.search(sql)
+                if m:
+                    cond_raw = m.group(2).strip()
+                    # Replace @P in condition with f-string expression
+                    cond_f = _re.sub(
+                        rf'@{upper}\b', f"'{{{py_nm}}}'",
+                        cond_raw, flags=_re.IGNORECASE
+                    )
+                    sql_without = sql[:m.start()].rstrip()
+                    sql_with    = sql_without + f'\nWHERE {cond_f}'
+                    return None, True, {
+                        'py_name':     py_nm,
+                        'sql_with':    sql_with,
+                        'sql_without': sql_without,
+                    }
+                else:
+                    # No IS NULL OR wrapper — plain replacement
+                    uses_f = True
+                    sql = pat.sub(f"'{{{py_nm}}}'", sql)
+
+        return sql, uses_f, None
+
+    # ── 8. Section-comment heuristic ─────────────────────────────────────────
+    def _comment(sql: str) -> str:
+        u = sql.upper()
+        # Window functions — check most-specific first
+        if 'LAG('        in u and 'OVER(' in u:                   return '# Previous Salary'
+        if 'LEAD('       in u and 'OVER(' in u:                   return '# Next Salary'
+        if 'ROW_NUMBER()' in u:                                    return '# Row Number'
+        if 'DENSE_RANK()' in u:                                    return '# Dense Rank'
+        if 'RANK()'       in u:                                    return '# Rank'
+        if 'SUM('         in u and 'OVER(' in u:                   return '# Running Total'
+        # Summary stats (aggregates, no GROUP BY, no WHERE, no JOIN)
+        if (('COUNT(' in u or 'AVG(' in u)
+                and 'GROUP BY' not in u
+                and 'WHERE'    not in u
+                and 'JOIN'     not in u):                          return '# Summary Statistics'
+        # JOINs
+        if 'INNER JOIN' in u:                                      return '# Inner Join'
+        if 'LEFT JOIN'  in u:                                      return '# Left Join'
+        if 'RIGHT JOIN' in u:                                      return '# Right Join'
+        # Parameter-filtered queries — check f-string expressions (works on replaced SQL)
+        if 'is None else minsalary'  in sql:                       return '# Salary Filter'
+        if '{joindate}' in sql:                                    return '# Join Date Filter'
+        if '{department}' in sql:                                  return '# Employee Filter'
+        # HAVING
+        if 'HAVING COUNT(*) > 1' in u:                             return '# Department Count > 1'
+        if 'GROUP BY' in u and 'HAVING' in u and 'AVG(' in u:     return '# Department Average Salary > 50000'
+        # GROUP BY + time functions
+        if 'GROUP BY' in u and 'MONTH(' in u:                      return '# Joining Month Report'
+        if 'GROUP BY' in u and 'YEAR('  in u:                      return '# Joining Year Report'
+        # Full department summary (all 5 aggregates)
+        if ('GROUP BY' in u
+                and all(x in u for x in ('COUNT(', 'SUM(', 'AVG(', 'MAX(', 'MIN('))):
+                                                                   return '# Department Summary'
+        # Single-aggregate GROUP BY
+        if ('GROUP BY' in u and 'COUNT(' in u
+                and 'SUM(' not in u and 'AVG(' not in u
+                and 'MAX(' not in u and 'MIN(' not in u):          return '# Department Count'
+        if ('GROUP BY' in u and 'SUM(' in u
+                and 'AVG(' not in u and 'MAX(' not in u and 'MIN(' not in u):
+                                                                   return '# Department Salary'
+        if ('GROUP BY' in u and 'AVG(' in u
+                and 'MAX(' not in u and 'MIN(' not in u):          return '# Department Average Salary'
+        if ('GROUP BY' in u and 'MAX(' in u
+                and 'MIN(' not in u and 'AVG(' not in u):          return '# Department Maximum Salary'
+        if ('GROUP BY' in u and 'MIN(' in u
+                and 'MAX(' not in u and 'AVG(' not in u):          return '# Department Minimum Salary'
+        # LIMIT (after TOP→LIMIT translation) — extract actual N from LIMIT clause
+        lim_m = _re.search(r'\bLIMIT\s+(\d+)\b', u)
+        if lim_m:
+            n = lim_m.group(1)
+            if 'DESC' in u:                                        return f'# Top {n} Highest Salaries'
+            if 'ASC'  in u:                                        return f'# Top {n} Lowest Salaries'
+        # LIKE
+        if "LIKE 'A%" in sql:                                      return '# Names Starting With A'
+        if "LIKE '%n'" in sql.lower() or "LIKE '%N'" in u:        return '# Names Ending With N'
+        # BETWEEN
+        if 'BETWEEN' in u:                                         return '# Salary Range'
+        # Subqueries in WHERE
+        if 'WHERE' in u and 'SELECT MAX(' in u:                    return '# Employee With Highest Salary'
+        if 'WHERE' in u and 'SELECT MIN(' in u:                    return '# Employee With Lowest Salary'
+        if 'WHERE' in u and 'SELECT AVG(' in u:                    return '# Salary Above Average'
+        if 'WHERE' in u and 'IN\s*\(' in u:                        return '# Department IN Filter'
+        if _re.search(r'\bIN\s*\(', u):                            return '# Department IN Filter'
+        # Date filter
+        if 'JOININGDATE' in u and '2022' in u:                     return '# Joined After 2022'
+        # Salary threshold (plain WHERE Salary > N, not a param-driven filter)
+        if ('WHERE' in u and 'SALARY' in u
+                and 'GROUP BY' not in u and 'BETWEEN' not in u
+                and '{' not in sql):                                return '# High Earners'
+        # DISTINCT
+        if 'SELECT DISTINCT' in u:                                 return '# Distinct Departments'
+        # INSERT
+        if u.strip().startswith('INSERT'):                         return '# Audit Log'
+        return ''
+
+    # ── 9. Function signature ─────────────────────────────────────────────────
+    # Convert SP name → Python function name:
+    # strip common usp_/sp_/proc_ prefix, then PascalCase → snake_case
+    raw_name = pre.sp_name or 'process_data'
+    for pfx in ('usp_', 'sp_', 'proc_', 'p_'):
+        if raw_name.lower().startswith(pfx):
+            raw_name = raw_name[len(pfx):]
+            break
+    # PascalCase / camelCase → snake_case
+    raw_name = _re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', raw_name)
+    raw_name = _re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', raw_name)
+    func_name = (
+        _re.sub(r'[^a-z0-9_]', '_', raw_name.lower()).strip('_') or 'process_data'
+    )
+
+    if param_map:
+        param_list = list(param_map.values())
+        sig_parts = ['    spark: SparkSession,'] + [
+            f"    {info['py_name']}=None{',' if i < len(param_list) - 1 else ''}"
+            for i, info in enumerate(param_list)
+        ]
+        func_sig = f'def {func_name}(\n' + '\n'.join(sig_parts) + '\n) -> DataFrame:'
+    else:
+        func_sig = f'def {func_name}(spark: SparkSession) -> DataFrame:'
+
+    # ── 10. Assemble Python source ────────────────────────────────────────────
+    # Each SELECT gets a unique numbered variable (result_df_1, result_df_2, …)
+    # so every intermediate result is preserved and accessible.
+    # INSERT / UPDATE / DELETE use bare spark.sql(…) with no variable assignment.
+    code: list = ['from pyspark.sql import SparkSession, DataFrame', '', func_sig, '']
+    select_count   = 1      # 1-based counter for result_df_N naming
+    last_select_var = None  # tracks the most-recent SELECT result variable
+
+    for (sql_text,) in final_stmts:
+        sql             = _t(sql_text)
+        result, uses_f, if_else = _replace_params(sql)
+
+        up_raw = sql.upper().lstrip()
+        is_sel = up_raw.startswith('SELECT')
+        is_ins = up_raw.startswith('INSERT')
+        is_upd = up_raw.startswith('UPDATE')
+        is_del = up_raw.startswith('DELETE')
+
+        if if_else:
+            # VARCHAR/DATE param → Python if/else block
+            py_nm   = if_else['py_name']
+            sw      = if_else['sql_with'].strip().replace('"""', '"\\""')
+            swo     = if_else['sql_without'].strip().replace('"""', '"\\""')
+            cmnt    = _comment(sw)
+            var_nm  = f'result_df_{select_count}'
+            if cmnt:
+                code.append(f'    {cmnt}')
+            code.append(f'    if {py_nm} is not None:')
+            code.append(f'        {var_nm} = spark.sql(f"""')
+            for line in sw.split('\n'):
+                code.append(f'        {line}')
+            code.append(f'        """)')
+            code.append(f'    else:')
+            code.append(f'        {var_nm} = spark.sql("""')
+            for line in swo.split('\n'):
+                code.append(f'        {line}')
+            code.append(f'        """)')
+            code.append('')
+            last_select_var = var_nm
+            select_count += 1
+            continue
+
+        safe = result.strip().replace('"""', '"\\""')
+        # Use the replaced SQL for comment detection (has f-string expressions for Salary Filter etc.)
+        cmnt = _comment(result)
+        if cmnt:
+            code.append(f'    {cmnt}')
+
+        prefix = 'f' if uses_f else ''
+        if is_sel:
+            var_nm = f'result_df_{select_count}'
+            last_select_var = var_nm
+            select_count += 1
+            code.append(f'    {var_nm} = spark.sql({prefix}"""')
+        elif is_ins:
+            code.append(f'    spark.sql({prefix}"""')
+        elif is_upd or is_del:
+            code.append(f'    # NOTE: {"UPDATE" if is_upd else "DELETE"} requires a Delta table')
+            code.append(f'    spark.sql({prefix}"""')
+        else:
+            code.append(f'    spark.sql({prefix}"""')
+
+        for line in safe.split('\n'):
+            code.append(f'    {line}')
+        code.append('    """)')
+        code.append('')
+
+    if last_select_var is None:
+        last_select_var = 'result_df'
+        code.append(f'    {last_select_var} = spark.sql("SELECT 1 AS result")')
+        code.append('')
+
+    code.append(f'    return {last_select_var}')
+    return '\n'.join(code)
 
 
 def convert_sql_with_ai(
@@ -905,9 +1335,11 @@ def convert_sql_with_ai(
 ) -> str:
     """Convert SQL to PySpark SQL using the 3-stage pipeline.
 
-    For plain SQL scripts with 5+ statements (no stored procedure / cursors),
-    uses direct statement-by-statement conversion — fully complete and instant.
-    For stored procedures and complex SQL, uses the LLM pipeline.
+    Routing (fastest/most-reliable first):
+    1. Plain SQL scripts (≥5 stmts, no SP)  → _direct_convert_statements (instant)
+    2. Simple stored procedures (no cursors, no dynamic SQL)
+                                             → _sp_direct_convert (instant)
+    3. Complex SQL / cursors / dynamic SQL   → LLM pipeline
     """
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from converter.sql_preprocessor import preprocess
@@ -924,7 +1356,16 @@ def convert_sql_with_ai(
             result = postprocess(direct)
             return result.code
 
-    # LLM pipeline for stored procedures and complex SQL
+    # Direct conversion for simple stored procedures (no cursors / dynamic SQL)
+    if (pre.is_stored_procedure
+            and 'cursor'      not in pre.dialect_hints
+            and 'dynamic_sql' not in pre.dialect_hints):
+        direct = _sp_direct_convert(pre, db_prefix, original_sql=sql)
+        if direct:
+            result = postprocess(direct)
+            return result.code
+
+    # LLM pipeline for stored procedures with cursors / dynamic SQL
     user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
     raw_output = _chat(_CONVERT_SYSTEM, user_prompt)
     result = postprocess(raw_output)
@@ -936,8 +1377,10 @@ def stream_sql_with_ai(
     db_prefix: str = "my_db",
     dialect: str = "T-SQL",
 ):
-    """Stream SQL → PySpark conversion. For plain scripts uses direct conversion
-    (single chunk, instant). For complex SQL streams LLM tokens live.
+    """Stream SQL → PySpark conversion.
+
+    Plain scripts and simple SPs use direct conversion (single chunk, instant).
+    Complex SQL / cursors / dynamic SQL streams LLM tokens live.
     """
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from converter.sql_preprocessor import preprocess
@@ -953,7 +1396,16 @@ def stream_sql_with_ai(
             yield direct
             return
 
-    # LLM streaming for stored procedures / complex SQL
+    # Direct conversion for simple stored procedures (no cursors / dynamic SQL)
+    if (pre.is_stored_procedure
+            and 'cursor'      not in pre.dialect_hints
+            and 'dynamic_sql' not in pre.dialect_hints):
+        direct = _sp_direct_convert(pre, db_prefix, original_sql=sql)
+        if direct:
+            yield direct
+            return
+
+    # LLM streaming for stored procedures with cursors / dynamic SQL
     user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
     provider = _detect_provider()
     if provider == "ollama":

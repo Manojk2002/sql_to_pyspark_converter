@@ -16,6 +16,7 @@ What this module does:
 """
 
 import ast
+import html as _html
 import re
 import textwrap
 from dataclasses import dataclass, field
@@ -156,6 +157,65 @@ def _dedup_imports(code: str) -> str:
     return "\n".join(result)
 
 
+# ─── Function import collapser ────────────────────────────────────────────────
+
+def _collapse_function_imports(code: str) -> str:
+    """Collapse repeated/bloated `from pyspark.sql.functions import ...` lines.
+
+    The LLM sometimes generates one import line per SQL statement, producing a
+    single enormous line with hundreds of repeated symbol names like:
+        from pyspark.sql.functions import avg, count, avg, count, avg, count...
+
+    This function:
+    1. Finds all `from pyspark.sql.functions import ...` lines.
+    2. Collects all unique symbols across them.
+    3. If the code already uses `F.` style, replaces with
+       `from pyspark.sql import functions as F` (canonical alias).
+    4. Otherwise emits a single clean deduplicated import line.
+    5. Removes all original import lines to avoid duplication.
+    """
+    pattern = re.compile(
+        r'^from\s+pyspark\.sql\.functions\s+import\s+([^\n]+)$',
+        re.MULTILINE,
+    )
+
+    seen: set = set()
+    all_symbols: list = []
+
+    for match in pattern.finditer(code):
+        for sym in match.group(1).split(","):
+            sym = sym.strip()
+            if sym and sym not in seen:
+                seen.add(sym)
+                all_symbols.append(sym)
+
+    if not all_symbols:
+        return code  # nothing to normalise
+
+    # Remove all existing `from pyspark.sql.functions import ...` lines
+    code = pattern.sub("", code)
+    # Collapse excessive blank lines left by removal
+    code = re.sub(r'\n{3,}', '\n\n', code)
+
+    # Choose canonical form: alias if F. calls exist, explicit list otherwise
+    if re.search(r'\bF\.', code):
+        consolidated = "from pyspark.sql import functions as F"
+    else:
+        consolidated = "from pyspark.sql.functions import " + ", ".join(all_symbols)
+
+    # Insert immediately after the first `from pyspark.sql import ...` line
+    lines = code.splitlines()
+    insert_at = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("from pyspark.sql import") or stripped.startswith("import pyspark"):
+            insert_at = i + 1
+            break
+
+    lines.insert(insert_at, consolidated)
+    return "\n".join(lines)
+
+
 # ── Cursor warning injector ──────────────────────────────────────────────────
 
 _CURSOR_NOTE = """
@@ -265,9 +325,12 @@ def postprocess(raw_output: str) -> PostprocessResult:
     # Step 1: Strip fences and prose
     code = _strip_fences(raw_output)
 
-    # Step 1b: Decode HTML entities and strip HTML tags that some models return
-    import html as _html
-    code = _html.unescape(code)                         # &gt;= → >=, &lt;= → <=, -&gt; → ->
+    # Step 1b: Decode HTML entities (multi-pass — handles double-encoded &amp;gt; → &gt; → >)
+    while True:
+        decoded = _html.unescape(code)
+        if decoded == code:
+            break
+        code = decoded
     code = re.sub(r"<br\s*/?>", "\n", code)             # <br> / <br/> → newline
     code = re.sub(r"<[^>]+>", "", code)                 # strip any remaining HTML tags
 
@@ -292,8 +355,9 @@ def postprocess(raw_output: str) -> PostprocessResult:
             warnings=["Model returned no code."],
         )
 
-    # Step 2: Deduplicate imports
+    # Step 2: Deduplicate imports and collapse bloated function import lines
     code = _dedup_imports(code)
+    code = _collapse_function_imports(code)
 
     # Step 3: Inject missing imports
     code = _inject_imports(code, warnings, injected)
