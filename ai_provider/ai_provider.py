@@ -1336,10 +1336,10 @@ def convert_sql_with_ai(
     """Convert SQL to PySpark SQL using the 3-stage pipeline.
 
     Routing (fastest/most-reliable first):
-    1. Plain SQL scripts (≥5 stmts, no SP)  → _direct_convert_statements (instant)
-    2. Simple stored procedures (no cursors, no dynamic SQL)
-                                             → _sp_direct_convert (instant)
-    3. Complex SQL / cursors / dynamic SQL   → LLM pipeline
+    1. Plain SQL scripts (≥5 stmts, no SP)      → _direct_convert_statements (instant)
+    2. Simple stored procedures (no cursor/dyn) → _sp_direct_convert (instant)
+    3. Complex SPs (cursor / dynamic SQL)       → rule-based ConversionPipeline (structured)
+    4. Fallback                                 → LLM pipeline
     """
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from converter.sql_preprocessor import preprocess
@@ -1365,7 +1365,19 @@ def convert_sql_with_ai(
             result = postprocess(direct)
             return result.code
 
-    # LLM pipeline for stored procedures with cursors / dynamic SQL
+    # Rule-based pipeline for complex SPs (cursor / dynamic SQL / transactions)
+    # Gives structured, correct output — no LLM hallucination
+    if pre.is_stored_procedure:
+        try:
+            from converter.conversion_pipeline import ConversionPipeline
+            pipeline = ConversionPipeline(db_prefix=db_prefix)
+            pr = pipeline.run(sql)
+            if pr.pyspark_code and not pr.errors:
+                return pr.pyspark_code
+        except Exception:
+            pass  # fall through to LLM
+
+    # LLM pipeline — last resort for non-SP complex scripts
     user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
     raw_output = _chat(_CONVERT_SYSTEM, user_prompt)
     result = postprocess(raw_output)
@@ -1379,8 +1391,9 @@ def stream_sql_with_ai(
 ):
     """Stream SQL → PySpark conversion.
 
-    Plain scripts and simple SPs use direct conversion (single chunk, instant).
-    Complex SQL / cursors / dynamic SQL streams LLM tokens live.
+    Plain scripts and simple SPs: direct conversion (single chunk, instant).
+    Complex SPs (cursor/dynamic SQL): rule-based pipeline (single chunk, structured).
+    Non-SP complex scripts: LLM streaming.
     """
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from converter.sql_preprocessor import preprocess
@@ -1405,7 +1418,19 @@ def stream_sql_with_ai(
             yield direct
             return
 
-    # LLM streaming for stored procedures with cursors / dynamic SQL
+    # Rule-based pipeline for complex SPs (cursor / dynamic SQL / transactions)
+    if pre.is_stored_procedure:
+        try:
+            from converter.conversion_pipeline import ConversionPipeline
+            pipeline = ConversionPipeline(db_prefix=db_prefix)
+            pr = pipeline.run(sql)
+            if pr.pyspark_code and not pr.errors:
+                yield pr.pyspark_code
+                return
+        except Exception:
+            pass  # fall through to LLM streaming
+
+    # LLM streaming — last resort for non-SP complex scripts
     user_prompt, _pre = _build_convert_user_prompt(sql, db_prefix, dialect)
     provider = _detect_provider()
     if provider == "ollama":
