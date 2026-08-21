@@ -268,10 +268,10 @@ ORDER BY emp_count DESC;"></textarea>
             <span class="btn-text">&#9889; Convert to PySpark</span>
           </button>
           <button class="btn" id="aiBtn" onclick="convertWithAI()"
-            style="background:#7C3AED;color:white;display:none;"
-            title="Use AI for smarter conversion of complex SQL">
+            style="background:#7C3AED;color:white;opacity:0.45;cursor:not-allowed;"
+            title="Checking AI status…" disabled>
             <span class="spinner"></span>
-            <span class="btn-text" id="aiBtnText">AI (ollama)</span>
+            <span class="btn-text" id="aiBtnText">AI (checking…)</span>
           </button>
           <button class="btn btn-secondary" onclick="clearAll()">&#128465; Clear</button>
         </div>
@@ -873,7 +873,11 @@ def raise_salaries(
       _aiThreshold   = (d.input_threshold || 4000);
 
       if (aiAvailable) {
-        aiBtn.style.display = "inline-flex";
+        // Enable button fully
+        aiBtn.disabled = false;
+        aiBtn.style.opacity = "1";
+        aiBtn.style.cursor = "pointer";
+        aiBtn.title = "Use AI for smarter conversion of complex SQL";
         statusEl.style.display = "none";
 
         // Badge: show both models if they differ
@@ -893,9 +897,23 @@ def raise_salaries(
         // Model hint below buttons — update whenever SQL changes
         updateModelHint();
       } else {
+        // Keep visible but clearly disabled
+        aiBtn.disabled = true;
+        aiBtn.style.opacity = "0.45";
+        aiBtn.style.cursor = "not-allowed";
+        aiBtn.title = "Ollama is not running. Start Ollama to enable AI conversion.";
+        document.getElementById("aiBtnText").textContent = "AI (offline)";
         statusEl.style.display = "none";
       }
-    }).catch(function(){});
+    }).catch(function() {
+      // Server unreachable — keep visible but mark offline
+      var aiBtn2 = document.getElementById("aiBtn");
+      aiBtn2.disabled = true;
+      aiBtn2.style.opacity = "0.45";
+      aiBtn2.style.cursor = "not-allowed";
+      aiBtn2.title = "Could not reach the server. Make sure the app is running.";
+      document.getElementById("aiBtnText").textContent = "AI (offline)";
+    });
   })();
 
   function updateModelHint() {

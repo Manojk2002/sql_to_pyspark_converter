@@ -592,30 +592,64 @@ _CONVERT_SYSTEM = textwrap.dedent("""\
     1. spark.sql("...") for ALL SQL (SELECT/INSERT/UPDATE/DELETE/MERGE/DDL/CTEs). Never DataFrame API.
     2. ONE function only — wrap ALL statements inside a SINGLE Python function. Never split into multiple functions.
        Write ALL spark.sql() calls in sequence BEFORE writing `return result_df`. Never write `return` early.
-    3. #temp tables → spark.sql("CREATE OR REPLACE TEMP VIEW temp AS SELECT ...")
+    3. #temp tables — COMBINE CREATE TABLE #t + INSERT INTO #t SELECT ... into ONE statement:
+       spark.sql(f"CREATE OR REPLACE TEMP VIEW t_name AS SELECT ... FROM ... WHERE ...")
+       Never emit a bare INSERT INTO temp_view. Never create an empty temp view then insert into it.
     4. IF/ELSE → Python if/elif/else. WHILE → Python while. Never .collect() in loops.
-    5. CURSOR → single bulk spark.sql(). Add: # NOTE: cursor replaced with bulk Spark SQL
-    6. BEGIN/COMMIT/ROLLBACK → remove. Add: # NOTE: Transaction replaced by Delta ACID
-    7. No .show(). Return the last meaningful SELECT result as result_df.
-    8. Function naming:
-       - Stored procedure → keep SP name as snake_case: def usp_my_proc(spark, ...)
-       - Plain SQL script → descriptive name WITHOUT usp_/sp_ prefix: def process_employees(spark)
-    9. Stored procedure params → typed Python args: def fn(spark: SparkSession, param: int = None)
-    10. T-SQL→Spark SQL inside spark.sql(): ISNULL→COALESCE, LEN→LENGTH, GETDATE()→CURRENT_TIMESTAMP(),
+    5. CURSOR — replace the entire DECLARE/OPEN/FETCH/WHILE/CLOSE loop with ONE bulk operation:
+       a. CREATE OR REPLACE TEMP VIEW to compute all rows (SELECT with the cursor's filter + computed cols).
+       b. MERGE INTO target_table USING temp_view to apply the UPDATE/INSERT in bulk.
+       NEVER reference T-SQL variables (@EmpID, @OldSalary, etc.) inside spark.sql() — they do not exist in Python.
+       Add: # NOTE: cursor replaced with bulk Spark SQL
+    6. BEGIN/COMMIT/ROLLBACK → Python try/except block. Add: # NOTE: Transaction replaced by Delta ACID
+    7. RAISERROR('msg', ...) → raise ValueError('msg'). RETURN after RAISERROR → already handled by raise.
+    8. IF @param IS NULL SET @param = GETDATE() → Python: if param is None: param = spark.sql("SELECT CURRENT_DATE AS d").first()["d"]
+    9. No .show(). Return the last meaningful SELECT result as result_df.
+    10. Function naming:
+        - Stored procedure → keep SP name as snake_case: def usp_my_proc(spark, ...)
+        - Plain SQL script → descriptive name WITHOUT usp_/sp_ prefix: def process_employees(spark)
+    11. Stored procedure params → typed Python args: def fn(spark: SparkSession, param: int = None)
+    12. T-SQL→Spark SQL inside spark.sql(): ISNULL→COALESCE, LEN→LENGTH, GETDATE()→CURRENT_TIMESTAMP(),
         TOP n→LIMIT n, DATEDIFF(u,s,e)→DATEDIFF(e,s), CONVERT→CAST, WITH(NOLOCK)→remove,
         STRING_AGG→CONCAT_WS+COLLECT_LIST, EXEC @sql→spark.sql(f"..."), TRY/CATCH→try/except.
-    11. IMPORTS — write EXACTLY these two lines, nothing else:
+        DROP TABLE #temp → omit entirely (temp views auto-expire with the session).
+    13. IMPORTS — write EXACTLY these two lines, nothing else:
         from pyspark.sql import SparkSession, DataFrame
         Do NOT write `from pyspark.sql.functions import ...` — functions are not needed when all SQL runs via spark.sql().
         Do NOT repeat or duplicate import lines.
+    14. OPTIONAL PARAMETER FILTERS (@param IS NULL OR col = @param):
+        Build the filter clause in Python BEFORE the spark.sql() call, then embed it with an f-string:
+            dept_filter = f"AND DepartmentID = {departmentid}" if departmentid is not None else ""
+            spark.sql(f"SELECT ... WHERE ... {dept_filter} ...")
+        NEVER write `AND ('{param}' IS NULL OR ...)` inside the SQL string — that is always False when param=None.
 
-    REQUIRED STRUCTURE — ONE function, ALL statements inside it:
+    REQUIRED STRUCTURE — cursor + validation + optional filter example:
     from pyspark.sql import SparkSession, DataFrame
-    def process_data(spark: SparkSession) -> DataFrame:
-        spark.sql("CREATE TABLE ...")
-        spark.sql("INSERT INTO ...")
-        spark.sql("UPDATE ...")
-        result_df = spark.sql("SELECT ...")   # last SELECT is result_df
+    def usp_raise_salaries(spark: SparkSession, raisepercent: float = None, departmentid: int = None, effectivedate=None) -> DataFrame:
+        if effectivedate is None:
+            effectivedate = spark.sql("SELECT CURRENT_DATE AS d").first()["d"]
+        if raisepercent is not None and (raisepercent <= 0 or raisepercent > 50):
+            raise ValueError("RaisePercent must be between 0 and 50.")
+        dept_filter = f"AND DepartmentID = {departmentid}" if departmentid is not None else ""
+        # NOTE: cursor replaced with bulk Spark SQL
+        spark.sql(f\"\"\"
+            CREATE OR REPLACE TEMP VIEW salaryaudit_temp AS
+            SELECT EmployeeID, Salary AS OldSalary,
+                   ROUND(Salary * (1 + {raisepercent} / 100.0), 2) AS NewSalary,
+                   DATE('{effectivedate}') AS ChangeDate
+            FROM Employees WHERE IsActive = 1 {dept_filter}
+        \"\"\")
+        spark.sql(f\"\"\"
+            MERGE INTO Employees AS tgt USING salaryaudit_temp AS src
+            ON tgt.EmployeeID = src.EmployeeID
+            WHEN MATCHED THEN UPDATE SET tgt.Salary = src.NewSalary, tgt.ModifiedDate = DATE('{effectivedate}')
+        \"\"\")
+        # NOTE: Transaction replaced by Delta ACID
+        try:
+            spark.sql(\"\"\"INSERT INTO SalaryAuditLog SELECT EmployeeID, OldSalary, NewSalary, ChangeDate FROM salaryaudit_temp\"\"\")
+        except Exception as e:
+            raise e
+        result_df = spark.sql(\"\"\"SELECT COUNT(*) AS EmployeesUpdated, SUM(NewSalary)-SUM(OldSalary) AS TotalIncrease FROM salaryaudit_temp\"\"\")
         return result_df
 """)
 
@@ -745,11 +779,13 @@ def _direct_convert_statements(pre, db_prefix: str, original_sql: str = "") -> s
     """Convert a plain SQL script directly to PySpark code — no LLM needed."""
     import re as _re
     import html as _html
+    import textwrap as _textwrap
 
     source_sql = original_sql if original_sql.strip() else pre.cleaned_sql
 
     # ── Parse: split on semicolons, keep preceding comment block per stmt ──
-    segments = []            # list of (comment_lines, sql_stmt_text)
+    # Each segment stores (comment_lines, raw_multiline_sql) — formatting preserved.
+    segments = []
     pending_comments = []
     current_stmt_lines = []
 
@@ -757,67 +793,71 @@ def _direct_convert_statements(pre, db_prefix: str, original_sql: str = "") -> s
         stripped = raw_line.strip()
         if stripped.startswith("--"):
             if current_stmt_lines:
-                s = " ".join(" ".join(current_stmt_lines).split()).strip()
-                if s:
-                    segments.append((list(pending_comments), s))
+                raw = "\n".join(line.rstrip() for line in current_stmt_lines).strip()
+                if raw:
+                    segments.append((list(pending_comments), raw))
                 current_stmt_lines = []
                 pending_comments = []
             pending_comments.append(stripped[2:].strip())
         elif ";" in stripped:
             before, _, _ = raw_line.partition(";")
             current_stmt_lines.append(before)
-            s = " ".join(" ".join(current_stmt_lines).split()).strip()
-            if s:
-                segments.append((list(pending_comments), s))
+            raw = "\n".join(line.rstrip() for line in current_stmt_lines).strip()
+            if raw:
+                segments.append((list(pending_comments), raw))
             current_stmt_lines = []
             pending_comments = []
         else:
             current_stmt_lines.append(raw_line)
 
     if current_stmt_lines:
-        s = " ".join(" ".join(current_stmt_lines).split()).strip()
-        if s:
-            segments.append((list(pending_comments), s))
+        raw = "\n".join(line.rstrip() for line in current_stmt_lines).strip()
+        if raw:
+            segments.append((list(pending_comments), raw))
 
     if not segments:
         return None
 
-    # ── Determine function name ────────────────────────────────────────────
+    # ── Determine function name (use flat form for keyword matching) ───────
     func_name = pre.sp_name or ""
     if not func_name:
-        first_sql = segments[0][1]
-        m = _re.search(r"\b(?:FROM|INTO|TABLE|VIEW)\s+(\w+)", first_sql, _re.IGNORECASE)
+        first_flat = " ".join(segments[0][1].split())
+        m = _re.search(r"\b(?:FROM|INTO|TABLE|VIEW)\s+(\w+)", first_flat, _re.IGNORECASE)
         func_name = f"process_{m.group(1).lower()}" if m else "process_data"
     func_name = _re.sub(r"[^a-z0-9_]", "_", func_name.lower()).strip("_") or "process_data"
 
-    # ── T-SQL → Spark SQL translations ────────────────────────────────────
+    # ── T-SQL → Spark SQL translations (multiline-safe) ───────────────────
     def _translate(stmt: str) -> str:
-        # Fix any HTML entities (&gt; → >, &lt; → <, &amp; → &, etc.)
         stmt = _html.unescape(stmt)
-        # SELECT TOP n → LIMIT n
+        # SELECT TOP n → add LIMIT n at end of statement
         top_m = _re.search(r"\bSELECT\s+TOP\s+(\d+)\b", stmt, _re.IGNORECASE)
         if top_m:
             n = top_m.group(1)
             stmt = _re.sub(r"\bTOP\s+\d+\b\s*", "", stmt, flags=_re.IGNORECASE)
-            stmt = stmt.rstrip() + f" LIMIT {n}"
+            stmt = stmt.rstrip() + f"\nLIMIT {n}"
         stmt = _re.sub(r"\bWITH\s*\(\s*NOLOCK\s*\)", "", stmt, flags=_re.IGNORECASE)
         stmt = _re.sub(r"\bISNULL\s*\(", "COALESCE(", stmt, flags=_re.IGNORECASE)
         stmt = _re.sub(r"\bLEN\s*\(", "LENGTH(", stmt, flags=_re.IGNORECASE)
         stmt = _re.sub(r"\bGETDATE\s*\(\s*\)", "CURRENT_TIMESTAMP()", stmt, flags=_re.IGNORECASE)
         stmt = _re.sub(r"\bGETUTCDATE\s*\(\s*\)", "UTC_TIMESTAMP()", stmt, flags=_re.IGNORECASE)
         stmt = _re.sub(r"\bCHARINDEX\s*\(", "LOCATE(", stmt, flags=_re.IGNORECASE)
-        # CREATE VIEW X AS → CREATE OR REPLACE TEMP VIEW X AS
         stmt = _re.sub(r"\bCREATE\s+VIEW\b", "CREATE OR REPLACE TEMP VIEW",
                        stmt, flags=_re.IGNORECASE)
-        # CREATE TABLE → CREATE TABLE IF NOT EXISTS (safe for re-runs)
         stmt = _re.sub(r"\bCREATE\s+TABLE\b(?!\s+IF)",
                        "CREATE TABLE IF NOT EXISTS", stmt, flags=_re.IGNORECASE)
-        # Strip PRIMARY KEY constraint (not supported in Spark DDL)
         stmt = _re.sub(r"\s+PRIMARY\s+KEY\b", "", stmt, flags=_re.IGNORECASE)
-        # VARCHAR(n) → STRING  (more portable across Spark/Delta)
         stmt = _re.sub(r"\bVARCHAR\s*\(\s*\d+\s*\)", "STRING", stmt, flags=_re.IGNORECASE)
-        # DECIMAL(p,s) → DECIMAL(p,s)  — already valid, keep as-is
-        return " ".join(stmt.split())
+        return stmt.strip()
+
+    # ── Helper: re-indent SQL lines for output in triple-quoted strings ────
+    def _fmt_sql(sql: str, indent: int = 8) -> str:
+        pad = " " * indent
+        lines = [l.rstrip() for l in sql.strip().splitlines()]
+        non_empty = [l for l in lines if l.strip()]
+        if non_empty:
+            min_ind = min(len(l) - len(l.lstrip()) for l in non_empty)
+            lines = [l[min_ind:] for l in lines]
+        return "\n".join(f"{pad}{l}" if l.strip() else "" for l in lines)
 
     # ── Group consecutive INSERTs to the same table into one multi-row INSERT ──
     def _group_inserts(segs):
@@ -825,8 +865,9 @@ def _direct_convert_statements(pre, db_prefix: str, original_sql: str = "") -> s
         i = 0
         while i < len(segs):
             comments, stmt = segs[i]
+            flat = " ".join(stmt.split())   # flatten only for pattern matching
             ins_m = _re.match(
-                r"INSERT\s+INTO\s+(\w+)\s+VALUES\s*\((.+)\)$", stmt, _re.IGNORECASE | _re.DOTALL
+                r"INSERT\s+INTO\s+(\w+)\s+VALUES\s*\((.+)\)$", flat, _re.IGNORECASE | _re.DOTALL
             )
             if ins_m:
                 table = ins_m.group(1)
@@ -834,9 +875,10 @@ def _direct_convert_statements(pre, db_prefix: str, original_sql: str = "") -> s
                 j = i + 1
                 while j < len(segs):
                     _, nxt = segs[j]
+                    nxt_flat = " ".join(nxt.split())
                     nxt_m = _re.match(
                         r"INSERT\s+INTO\s+(\w+)\s+VALUES\s*\((.+)\)$",
-                        nxt, _re.IGNORECASE | _re.DOTALL
+                        nxt_flat, _re.IGNORECASE | _re.DOTALL
                     )
                     if nxt_m and nxt_m.group(1).lower() == table.lower():
                         values.append(nxt_m.group(2))
@@ -873,22 +915,32 @@ def _direct_convert_statements(pre, db_prefix: str, original_sql: str = "") -> s
             if c:
                 code_lines.append(f"    # {c}")
 
-        is_select = bool(_re.match(r"SELECT\b", stmt, _re.IGNORECASE))
-        is_update = bool(_re.match(r"UPDATE\b", stmt, _re.IGNORECASE))
-        is_delete = bool(_re.match(r"DELETE\b", stmt, _re.IGNORECASE))
+        flat_stmt = " ".join(stmt.split())
+        is_select = bool(_re.match(r"SELECT\b", flat_stmt, _re.IGNORECASE))
+        is_update = bool(_re.match(r"UPDATE\b", flat_stmt, _re.IGNORECASE))
+        is_delete = bool(_re.match(r"DELETE\b", flat_stmt, _re.IGNORECASE))
         safe = stmt.replace('"""', '"\\"')
+        formatted = _fmt_sql(safe)
 
         if is_update:
             code_lines.append("    # NOTE: UPDATE requires a Delta table")
-            code_lines.append(f'    spark.sql("""{safe}""")')
+            code_lines.append('    spark.sql("""')
+            code_lines.append(formatted)
+            code_lines.append('    """)')
         elif is_delete:
             code_lines.append("    # NOTE: DELETE requires a Delta table")
-            code_lines.append(f'    spark.sql("""{safe}""")')
+            code_lines.append('    spark.sql("""')
+            code_lines.append(formatted)
+            code_lines.append('    """)')
         elif is_select:
             has_select = True
-            code_lines.append(f'    result_df = spark.sql("""{safe}""")')
+            code_lines.append('    result_df = spark.sql("""')
+            code_lines.append(formatted)
+            code_lines.append('    """)')
         else:
-            code_lines.append(f'    spark.sql("""{safe}""")')
+            code_lines.append('    spark.sql("""')
+            code_lines.append(formatted)
+            code_lines.append('    """)')
 
         if comments:
             code_lines.append("")
@@ -1468,10 +1520,10 @@ def convert_sql_with_ai(
     """Convert SQL to PySpark SQL using the 3-stage pipeline.
 
     Routing (fastest/most-reliable first):
-    1. Plain SQL scripts (≥5 stmts, no SP)      → _direct_convert_statements (instant)
-    2. Simple stored procedures (no cursor/dyn) → _sp_direct_convert (instant)
-    3. Complex SPs (cursor / dynamic SQL)       → rule-based ConversionPipeline (structured)
-    4. Fallback                                 → LLM pipeline
+    1. Plain SQL scripts (≥1 stmt, no SP)        → _direct_convert_statements (instant)
+    2. Simple stored procedures (no cursor/dyn)  → _sp_direct_convert (instant)
+    3. Complex SPs (cursor / dynamic SQL)        → rule-based ConversionPipeline (structured)
+    4. Fallback                                  → LLM pipeline
     """
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from converter.sql_preprocessor import preprocess
@@ -1482,7 +1534,8 @@ def convert_sql_with_ai(
                  if s.strip() and not s.strip().startswith("--")]
 
     # Direct conversion for plain SQL scripts (reliable, complete, instant)
-    if not pre.is_stored_procedure and len(raw_stmts) >= 5:
+    # Threshold = 1: even a single SELECT/INSERT/UPDATE needs no LLM
+    if not pre.is_stored_procedure and len(raw_stmts) >= 1:
         direct = _direct_convert_statements(pre, db_prefix, original_sql=sql)
         if direct:
             result = postprocess(direct)
@@ -1521,7 +1574,8 @@ def stream_sql_with_ai(
                  if s.strip() and not s.strip().startswith("--")]
 
     # Direct conversion for plain SQL scripts
-    if not pre.is_stored_procedure and len(raw_stmts) >= 5:
+    # Threshold = 1: even a single SELECT/INSERT/UPDATE needs no LLM
+    if not pre.is_stored_procedure and len(raw_stmts) >= 1:
         direct = _direct_convert_statements(pre, db_prefix, original_sql=sql)
         if direct:
             yield direct
