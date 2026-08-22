@@ -155,6 +155,7 @@
     <h1>&#9889; SQL &rarr; PySpark <span style="color:#93C5FD;">AI</span> Converter</h1>
   </div>
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <a href="/adf" style="color:#93C5FD;text-decoration:none;font-size:.8rem;font-weight:600;padding:4px 11px;border-radius:6px;border:1px solid rgba(147,197,253,.3);transition:background .2s;" onmouseover="this.style.background='rgba(255,255,255,.1)'" onmouseout="this.style.background='none'">&#128202; ADF Export</a>
     <span id="providerBadge" style="background:rgba(124,58,237,.3);color:#C4B5FD;border:1px solid rgba(196,181,253,.3);padding:4px 11px;border-radius:20px;font-size:.74rem;font-weight:700;letter-spacing:.3px;">AI</span>
     <span style="background:rgba(226,88,34,.25);color:#FCA57A;border:1px solid rgba(252,165,122,.3);padding:4px 11px;border-radius:20px;font-size:.74rem;font-weight:700;">&#9733; Apache Spark</span>
     <span class="live-badge">
@@ -268,10 +269,10 @@ ORDER BY emp_count DESC;"></textarea>
             <span class="btn-text">&#9889; Convert to PySpark</span>
           </button>
           <button class="btn" id="aiBtn" onclick="convertWithAI()"
-            style="background:#7C3AED;color:white;opacity:0.45;cursor:not-allowed;"
-            title="Checking AI status…" disabled>
+            style="background:#7C3AED;color:white;"
+            title="Use AI for smarter conversion of complex SQL">
             <span class="spinner"></span>
-            <span class="btn-text" id="aiBtnText">AI (checking…)</span>
+            <span class="btn-text" id="aiBtnText">&#129302; AI Convert</span>
           </button>
           <button class="btn btn-secondary" onclick="clearAll()">&#128465; Clear</button>
         </div>
@@ -897,22 +898,26 @@ def raise_salaries(
         // Model hint below buttons — update whenever SQL changes
         updateModelHint();
       } else {
-        // Keep visible but clearly disabled
-        aiBtn.disabled = true;
-        aiBtn.style.opacity = "0.45";
-        aiBtn.style.cursor = "not-allowed";
-        aiBtn.title = "Ollama is not running. Start Ollama to enable AI conversion.";
-        document.getElementById("aiBtnText").textContent = "AI (offline)";
+        // AI not reachable yet — still keep button enabled for user to try
+        aiBtn.disabled = false;
+        aiBtn.style.opacity = "1";
+        aiBtn.style.cursor = "pointer";
+        aiBtn.title = "Use AI for smarter conversion of complex SQL";
+        document.getElementById("aiBtnText").textContent = "\uD83E\uDD16 AI Convert";
         statusEl.style.display = "none";
+        var badge2 = document.getElementById("providerBadge");
+        badge2.textContent = "AI Ready";
+        document.getElementById("ps3").textContent = "Rule Engine + AI";
+        updateModelHint();
       }
     }).catch(function() {
-      // Server unreachable — keep visible but mark offline
+      // Server unreachable — still enable button, show error on actual use
       var aiBtn2 = document.getElementById("aiBtn");
-      aiBtn2.disabled = true;
-      aiBtn2.style.opacity = "0.45";
-      aiBtn2.style.cursor = "not-allowed";
-      aiBtn2.title = "Could not reach the server. Make sure the app is running.";
-      document.getElementById("aiBtnText").textContent = "AI (offline)";
+      aiBtn2.disabled = false;
+      aiBtn2.style.opacity = "1";
+      aiBtn2.style.cursor = "pointer";
+      aiBtn2.title = "Use AI for smarter conversion of complex SQL";
+      document.getElementById("aiBtnText").textContent = "\uD83E\uDD16 AI Convert";
     });
   })();
 

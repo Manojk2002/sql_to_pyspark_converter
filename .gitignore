@@ -40,6 +40,14 @@ uploads/
 # Output (generated files)
 output/
 
+# ADF exported files
+exports/
+
+# Demo / temp files
+test_demo.db
+djd
+mydb
+
 # Pytest
 .pytest_cache/
 .coverage

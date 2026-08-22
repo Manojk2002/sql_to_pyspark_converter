@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ADF Data Export | SQL → Excel / CSV / Parquet</title>
+  <style>
+    :root {
+      --dark-blue:#1B3A6B; --med-blue:#2563EB; --light-bg:#F1F5F9;
+      --border:#D1D9E0; --success:#059669; --warn:#D97706;
+      --danger:#DC2626; --code-bg:#0D1117; --code-fg:#E6EDF3;
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:"Segoe UI",Arial,sans-serif;background:var(--light-bg);color:#1A1A2E}
+    header{background:linear-gradient(135deg,#0C1B3A 0%,#1B3A6B 60%,#1E4585 100%);
+      color:white;padding:14px 28px;
+      display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;
+      box-shadow:0 3px 20px rgba(0,0,0,.45);border-bottom:1px solid rgba(255,255,255,.07)}
+    header h1{font-size:1.45rem;font-weight:800;letter-spacing:-.3px}
+    header .sub{font-size:.79rem;opacity:.7;margin-top:3px;display:block;letter-spacing:.2px}
+    .nav-link{color:#93C5FD;text-decoration:none;font-size:.85rem;font-weight:600;
+      padding:4px 12px;border-radius:6px;transition:background .2s}
+    .nav-link:hover{background:rgba(255,255,255,.1)}
+    .container{max-width:960px;margin:0 auto;padding:24px 16px}
+    .card{background:white;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.06),0 4px 14px rgba(0,0,0,.08);overflow:hidden;margin-bottom:20px}
+    .card-header{background:linear-gradient(90deg,#1B3A6B 0%,#1D4E90 100%);color:white;padding:11px 16px;font-weight:600;font-size:.92rem;
+      display:flex;align-items:center;gap:7px}
+    .card-body{padding:18px}
+    .form-row{margin-bottom:14px}
+    .form-row label{display:block;font-size:.82rem;font-weight:600;color:var(--dark-blue);margin-bottom:4px}
+    .form-row input,.form-row select,.form-row textarea{
+      width:100%;border:1px solid var(--border);border-radius:6px;
+      padding:8px 12px;font-size:.87rem;background:white;transition:border-color .2s}
+    .form-row input:focus,.form-row select:focus,.form-row textarea:focus{outline:none;border-color:var(--med-blue);box-shadow:0 0 0 3px rgba(46,116,181,.12)}
+    .form-row textarea{font-family:"Consolas","Courier New",monospace;resize:vertical;min-height:120px}
+    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .form-grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+    @media(max-width:640px){.form-grid,.form-grid-3{grid-template-columns:1fr}}
+    .checkbox-group{display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:6px}
+    .checkbox-group label{display:flex;align-items:center;gap:6px;font-size:.87rem;font-weight:500;cursor:pointer;color:#333}
+    .checkbox-group input[type=checkbox]{width:18px;height:18px;accent-color:var(--med-blue)}
+    .btn{padding:10px 22px;border:none;border-radius:7px;font-size:.9rem;font-weight:600;
+      cursor:pointer;transition:all .18s;display:inline-flex;align-items:center;gap:6px;
+      box-shadow:0 1px 3px rgba(0,0,0,.12)}
+    .btn-primary{background:var(--med-blue);color:white}
+    .btn-primary:hover{background:var(--dark-blue);transform:translateY(-1px);box-shadow:0 3px 8px rgba(0,0,0,.2)}
+    .btn-secondary{background:#F1F5F9;color:var(--dark-blue);border:1px solid var(--border)}
+    .btn-secondary:hover{background:#E2E8F0}
+    .btn-success{background:var(--success);color:white}
+    .btn-success:hover{background:#047857}
+    .btn-group{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+    .spinner{display:none;width:16px;height:16px;border:2.5px solid rgba(255,255,255,.3);
+      border-top-color:white;border-radius:50%;animation:spin .7s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .btn.loading .spinner{display:inline-block}
+    .btn.loading .btn-text{display:none}
+    .result-box{margin-top:16px;padding:14px 18px;border-radius:8px;font-size:.87rem;display:none}
+    .result-box.success{background:#F0FDF4;border:2px solid #86EFAC;color:#166534}
+    .result-box.error{background:#FEF2F2;border:2px solid #FCA5A5;color:#991B1B}
+    .result-box h3{margin-bottom:8px;font-size:1rem}
+    .result-box ul{list-style:none;padding:0;margin:8px 0 0}
+    .result-box ul li{padding:4px 0;font-size:.84rem;font-family:"Consolas",monospace}
+    .result-box ul li::before{content:"✓ ";color:var(--success);font-weight:700}
+    .pipeline-banner{background:linear-gradient(90deg,#0C1B3A,#1B3A6B,#1D4E90);color:white;
+      padding:8px 28px;display:flex;align-items:center;justify-content:center;gap:0;
+      flex-wrap:wrap;border-bottom:1px solid rgba(255,255,255,.08)}
+    .pipeline-step{background:rgba(255,255,255,.12);padding:4px 14px;border-radius:20px;font-size:.76rem;font-weight:700}
+    .pipeline-arrow{margin:0 6px;opacity:.5;font-size:.85rem}
+    .pipeline-step.active{background:rgba(37,99,235,.5);border:1px solid rgba(147,197,253,.4)}
+    .info-box{background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:.84rem;color:#1E40AF}
+    .download-links{margin-top:10px}
+    .download-links a{display:inline-flex;align-items:center;gap:5px;padding:6px 14px;
+      background:var(--med-blue);color:white;border-radius:6px;font-size:.82rem;font-weight:600;
+      text-decoration:none;margin-right:8px;margin-bottom:6px;transition:background .2s}
+    .download-links a:hover{background:var(--dark-blue)}
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>&#128202; ADF Data Export</h1>
+    <span class="sub">Read from SQL Database → Export to Excel / CSV / Parquet</span>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <a href="/" class="nav-link">&#9889; SQL→PySpark Converter</a>
+    <span style="background:rgba(37,99,235,.3);color:#93C5FD;border:1px solid rgba(147,197,253,.3);padding:4px 11px;border-radius:20px;font-size:.74rem;font-weight:700;">SQLAlchemy + Pandas</span>
+  </div>
+</header>
+
+<div class="pipeline-banner">
+  <span class="pipeline-step active" id="pAdf1">&#128450; SQL Database</span>
+  <span class="pipeline-arrow">&rarr;</span>
+  <span class="pipeline-step" id="pAdf2">&#128269; Execute Query</span>
+  <span class="pipeline-arrow">&rarr;</span>
+  <span class="pipeline-step" id="pAdf3">&#128196; pandas DataFrame</span>
+  <span class="pipeline-arrow">&rarr;</span>
+  <span class="pipeline-step" id="pAdf4">&#128194; Export Files (.xlsx / .csv / .parquet)</span>
+</div>
+
+<div class="container">
+
+  <div class="info-box">
+    <strong>&#128161; ADF Functionality:</strong> Connect to any SQL database (PostgreSQL, SQL Server, MySQL, SQLite), run a query, and export results to Excel (.xlsx), CSV (.csv), and/or Parquet (.parquet) files — ready for storage in your repository.
+  </div>
+
+  <!-- Database Connection -->
+  <div class="card">
+    <div class="card-header">&#128450; Database Connection</div>
+    <div class="card-body">
+      <div class="form-grid">
+        <div class="form-row">
+          <label>Database Type</label>
+          <select id="dbType">
+            <option value="postgresql">PostgreSQL</option>
+            <option value="sqlserver">SQL Server</option>
+            <option value="mysql">MySQL</option>
+            <option value="sqlite">SQLite</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Host</label>
+          <input type="text" id="dbHost" placeholder="localhost" value="localhost"/>
+        </div>
+      </div>
+      <div class="form-grid-3">
+        <div class="form-row">
+          <label>Port</label>
+          <input type="text" id="dbPort" placeholder="5432" value="5432"/>
+        </div>
+        <div class="form-row">
+          <label>Database Name</label>
+          <input type="text" id="dbName" placeholder="mydatabase"/>
+        </div>
+        <div class="form-row">
+          <label>Username</label>
+          <input type="text" id="dbUser" placeholder="username"/>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Password</label>
+        <input type="password" id="dbPassword" placeholder="password"/>
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-secondary" onclick="testConnection()">
+          <span class="spinner"></span>
+          <span class="btn-text">&#128268; Test Connection</span>
+        </button>
+      </div>
+      <div id="connResult" class="result-box"></div>
+    </div>
+  </div>
+
+  <!-- SQL Query -->
+  <div class="card">
+    <div class="card-header">&#128196; SQL Query</div>
+    <div class="card-body">
+      <div class="form-row">
+        <label>SELECT Query to Execute</label>
+        <textarea id="sqlQuery" rows="6" placeholder="SELECT *
+FROM provider_performance
+WHERE status = 'active'
+ORDER BY score DESC"></textarea>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export Options -->
+  <div class="card">
+    <div class="card-header">&#128194; Export Options</div>
+    <div class="card-body">
+      <div class="form-grid">
+        <div class="form-row">
+          <label>Output Filename (without extension)</label>
+          <input type="text" id="outputName" placeholder="provider_performance" value="export_data"/>
+        </div>
+        <div class="form-row">
+          <label>Export Formats</label>
+          <div class="checkbox-group">
+            <label><input type="checkbox" id="fmtXlsx" checked/> Excel (.xlsx)</label>
+            <label><input type="checkbox" id="fmtCsv" checked/> CSV (.csv)</label>
+            <label><input type="checkbox" id="fmtParquet" checked/> Parquet (.parquet)</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="btn-group">
+        <button class="btn btn-primary" id="exportBtn" onclick="runExport()">
+          <span class="spinner"></span>
+          <span class="btn-text">&#128640; Export Data</span>
+        </button>
+        <button class="btn btn-secondary" onclick="clearForm()">&#128465; Clear</button>
+      </div>
+
+      <div id="exportResult" class="result-box"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+function getConnParams() {
+  return {
+    db_type:  document.getElementById('dbType').value,
+    host:     document.getElementById('dbHost').value.trim(),
+    port:     document.getElementById('dbPort').value.trim(),
+    database: document.getElementById('dbName').value.trim(),
+    username: document.getElementById('dbUser').value.trim(),
+    password: document.getElementById('dbPassword').value,
+  };
+}
+
+async function testConnection() {
+  const btn = document.querySelector('[onclick="testConnection()"]');
+  btn.classList.add('loading');
+  const box = document.getElementById('connResult');
+  box.style.display = 'none';
+
+  try {
+    const resp = await fetch('/adf/test-connection', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(getConnParams()),
+    });
+    const data = await resp.json();
+    box.style.display = 'block';
+    if (data.success) {
+      box.className = 'result-box success';
+      box.innerHTML = '<strong>&#9989; ' + data.message + '</strong>';
+    } else {
+      box.className = 'result-box error';
+      box.innerHTML = '<strong>&#10060; Connection Failed</strong><br/>' + escHtml(data.message);
+    }
+  } catch (e) {
+    box.style.display = 'block';
+    box.className = 'result-box error';
+    box.innerHTML = '<strong>&#10060; Error:</strong> ' + escHtml(e.message);
+  } finally {
+    btn.classList.remove('loading');
+  }
+}
+
+async function runExport() {
+  const btn = document.getElementById('exportBtn');
+  btn.classList.add('loading');
+  const box = document.getElementById('exportResult');
+  box.style.display = 'none';
+
+  // Highlight pipeline steps
+  document.getElementById('pAdf2').classList.add('active');
+
+  const formats = [];
+  if (document.getElementById('fmtXlsx').checked) formats.push('xlsx');
+  if (document.getElementById('fmtCsv').checked) formats.push('csv');
+  if (document.getElementById('fmtParquet').checked) formats.push('parquet');
+
+  const payload = {
+    ...getConnParams(),
+    query:       document.getElementById('sqlQuery').value.trim(),
+    formats:     formats,
+    output_name: document.getElementById('outputName').value.trim() || 'export_data',
+  };
+
+  try {
+    const resp = await fetch('/adf/export', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    box.style.display = 'block';
+
+    if (data.success) {
+      document.getElementById('pAdf3').classList.add('active');
+      document.getElementById('pAdf4').classList.add('active');
+      box.className = 'result-box success';
+      let html = '<h3>&#9989; Export Successful!</h3>';
+      html += '<p>Records: <strong>' + data.records_extracted + '</strong> | Columns: <strong>' + data.columns_extracted + '</strong></p>';
+      html += '<ul>';
+      data.files_created.forEach(f => {
+        const fname = f.split(/[/\\]/).pop();
+        html += '<li>' + escHtml(fname) + '</li>';
+      });
+      html += '</ul>';
+      html += '<div class="download-links">';
+      data.files_created.forEach(f => {
+        const fname = f.split(/[/\\]/).pop();
+        html += '<a href="/adf/download/' + encodeURIComponent(fname) + '">&#11015; ' + escHtml(fname) + '</a>';
+      });
+      html += '</div>';
+      box.innerHTML = html;
+    } else {
+      box.className = 'result-box error';
+      box.innerHTML = '<strong>&#10060; Export Failed</strong><br/>' + escHtml(data.error);
+    }
+  } catch (e) {
+    box.style.display = 'block';
+    box.className = 'result-box error';
+    box.innerHTML = '<strong>&#10060; Error:</strong> ' + escHtml(e.message);
+  } finally {
+    btn.classList.remove('loading');
+  }
+}
+
+function clearForm() {
+  document.getElementById('sqlQuery').value = '';
+  document.getElementById('outputName').value = 'export_data';
+  document.getElementById('exportResult').style.display = 'none';
+  document.getElementById('connResult').style.display = 'none';
+  ['pAdf2','pAdf3','pAdf4'].forEach(id => document.getElementById(id).classList.remove('active'));
+}
+
+function escHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+// Auto-set port when DB type changes
+document.getElementById('dbType').addEventListener('change', function() {
+  const ports = {postgresql:'5432', sqlserver:'1433', mysql:'3306', sqlite:''};
+  document.getElementById('dbPort').value = ports[this.value] || '';
+});
+</script>
+
+</body>
+</html>

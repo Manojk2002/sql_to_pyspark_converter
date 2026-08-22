@@ -7,8 +7,12 @@ Open: http://localhost:5000
 import os
 import sys
 import json
+import time
 import pathlib
 import traceback
+import subprocess
+import threading
+import urllib.request
 
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from werkzeug.utils import secure_filename
@@ -29,6 +33,86 @@ from ai_provider.ai_provider import (
     explain_pyspark_code,
     optimize_pyspark_code,
 )
+from adf_export.data_exporter import export_data, test_connection, EXPORT_DIR
+
+
+# ── Ollama auto-start ─────────────────────────────────────────────────────────
+
+_OLLAMA_PATHS = [
+    os.path.expanduser(r"~\AppData\Local\Programs\Ollama\ollama.exe"),
+    r"C:\Program Files\Ollama\ollama.exe",
+    "ollama",  # if already on PATH
+]
+_OLLAMA_API = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+_OLLAMA_FAST_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
+
+
+def _ollama_reachable(timeout: float = 2.0) -> bool:
+    try:
+        with urllib.request.urlopen(f"{_OLLAMA_API}/api/tags", timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _start_ollama_serve():
+    """Launch `ollama serve` in the background if not already running."""
+    if _ollama_reachable():
+        return True
+    for path in _OLLAMA_PATHS:
+        if path == "ollama" or os.path.exists(path):
+            try:
+                flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                subprocess.Popen(
+                    [path, "serve"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=flags,
+                )
+                print("  [Ollama] Starting server...", flush=True)
+                for _ in range(15):          # wait up to 15 s
+                    time.sleep(1)
+                    if _ollama_reachable():
+                        print("  [Ollama] Server ready.", flush=True)
+                        return True
+                print("  [Ollama] Timed out waiting for server.", flush=True)
+                return False
+            except Exception as e:
+                print(f"  [Ollama] Could not start: {e}", flush=True)
+    return False
+
+
+def _prewarm_ollama():
+    """Load the model into RAM/GPU so the first real request is instant."""
+    if not _ollama_reachable():
+        return
+    try:
+        payload = json.dumps({
+            "model": _OLLAMA_FAST_MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {"num_predict": 1},
+            "keep_alive": -1,
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(
+            f"{_OLLAMA_API}/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60):
+            pass
+        print(f"  [Ollama] Model '{_OLLAMA_FAST_MODEL}' warmed up — ready!", flush=True)
+    except Exception as e:
+        print(f"  [Ollama] Pre-warm skipped: {e}", flush=True)
+
+
+def _ensure_ollama_background():
+    """Start Ollama and pre-warm model in a background thread (non-blocking)."""
+    def _run():
+        if _start_ollama_serve():
+            _prewarm_ollama()
+    threading.Thread(target=_run, daemon=True).start()
+
 
 app = Flask(__name__, template_folder="web_ui/templates")
 app.config["JSON_SORT_KEYS"] = False
@@ -246,6 +330,28 @@ def _check_sqlglot() -> bool:
  
 # --- AI endpoints ------------------------------------------------------------
 
+def _rule_based_convert(sql_text: str, as_dict: bool = False):
+    """Run the rule-based converter and return a JSON response or dict."""
+    parsed = _parser.parse(sql_text)
+    report = _analyzer.analyze(parsed)
+    gen = PySparkGenerator()
+    code = gen.generate(parsed, report)
+    safe_name = (parsed.sp_name or "query").replace(".", "_").replace("[", "").replace("]", "")
+    out_file = OUTPUT_DIR / f"{safe_name}_pyspark.py"
+    out_file.write_text(code, encoding="utf-8")
+    quick_code = _extract_quick_view(code, sql_text)
+    result = {
+        "code":       code,
+        "quick_code": quick_code,
+        "sp_name":    safe_name,
+        "model_used": "rule-based",
+        "warnings":   report.conversion_warnings,
+        "source":     "rule-based",
+    }
+    if as_dict:
+        return result
+    return jsonify(result)
+
 @app.route("/ai-status")
 def ai_status():
     """Return the active AI provider, model, and availability status."""
@@ -263,9 +369,8 @@ def ai_status():
 @app.route("/ai-convert", methods=["POST"])
 def ai_convert():
     """
-    Convert SQL to PySpark SQL using the active AI provider (GPT-4.1-mini,
-    HuggingFace, Gemini, or Ollama).  Falls back to rule-based converter if
-    no AI provider is configured.
+    Convert SQL to PySpark SQL using the active AI provider.
+    Falls back to rule-based converter if no AI provider is reachable.
     """
     data      = request.get_json(force=True)
     sql_text  = (data.get("sql") or "").strip()
@@ -275,13 +380,8 @@ def ai_convert():
         return jsonify({"error": "No SQL provided"}), 400
 
     if not ai_available():
-        info = get_provider_info()
-        return jsonify({
-            "error": (
-                f"AI provider '{info['provider']}' is not configured or not reachable. "
-                "See .env.example for setup instructions."
-            )
-        }), 503
+        # Fall back to rule-based converter
+        return _rule_based_convert(sql_text)
  
     try:
         # preprocess once for sp_name / dialect_hints metadata
@@ -328,8 +428,27 @@ def ai_convert_stream():
         return jsonify({"error": "No SQL provided"}), 400
 
     if not ai_available():
-        info = get_provider_info()
-        return jsonify({"error": f"AI provider '{info['provider']}' not reachable."}), 503
+        # AI offline — run rule-based converter and emit as a stream result
+        def _fallback_generate():
+            yield "data: [STEP] AI provider offline — using rule-based converter\n\n"
+            try:
+                result = _rule_based_convert(sql_text, as_dict=True)
+                payload = json.dumps({
+                    "code":         result["code"],
+                    "sp_name":      result["sp_name"],
+                    "syntax_valid": True,
+                    "warnings":     result.get("warnings", []),
+                    "model_used":   "rule-based",
+                }, ensure_ascii=True)
+                yield f"data: [RESULT] {payload}\n\n"
+            except Exception as exc:
+                yield f"data: [ERROR] {json.dumps(str(exc))}\n\n"
+            yield "data: [DONE]\n\n"
+        return Response(
+            stream_with_context(_fallback_generate()),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     def generate():
         try:
@@ -385,13 +504,13 @@ def ai_explain():
     if not code:
         return jsonify({"error": "No code provided"}), 400
     if not ai_available():
-        return jsonify({"error": "AI provider not configured. See .env.example."}), 503
+        return jsonify({"code": code, "warning": "AI provider offline — code returned unchanged."})
  
     try:
         explained = explain_pyspark_code(code)
         return jsonify({"code": explained})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"code": code, "warning": str(exc)})
  
  
 @app.route("/ai-optimize", methods=["POST"])
@@ -403,15 +522,73 @@ def ai_optimize():
     if not code:
         return jsonify({"error": "No code provided"}), 400
     if not ai_available():
-        return jsonify({"error": "AI provider not configured. See .env.example."}), 503
+        return jsonify({"code": code, "warning": "AI provider offline — code returned unchanged."})
  
     try:
         optimized = optimize_pyspark_code(code)
         return jsonify({"code": optimized})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"code": code, "warning": str(exc)})
  
  
+# --- ADF Data Export endpoints ------------------------------------------------
+
+@app.route("/adf")
+def adf_page():
+    """Render the ADF Data Export page."""
+    return render_template("adf_export.html")
+
+
+@app.route("/adf/test-connection", methods=["POST"])
+def adf_test_connection():
+    """Test database connectivity."""
+    data = request.get_json(force=True)
+    result = test_connection(
+        db_type=data.get("db_type", ""),
+        host=data.get("host", ""),
+        port=data.get("port", ""),
+        database=data.get("database", ""),
+        username=data.get("username", ""),
+        password=data.get("password", ""),
+    )
+    return jsonify(result)
+
+
+@app.route("/adf/export", methods=["POST"])
+def adf_export():
+    """Execute query and export data to selected formats."""
+    data = request.get_json(force=True)
+    result = export_data(
+        db_type=data.get("db_type", ""),
+        host=data.get("host", ""),
+        port=data.get("port", ""),
+        database=data.get("database", ""),
+        username=data.get("username", ""),
+        password=data.get("password", ""),
+        query=data.get("query", ""),
+        formats=data.get("formats", []),
+        output_name=data.get("output_name", "export_data"),
+    )
+    return jsonify({
+        "success": result.success,
+        "records_extracted": result.records_extracted,
+        "columns_extracted": result.columns_extracted,
+        "files_created": result.files_created,
+        "error": result.error,
+    })
+
+
+@app.route("/adf/download/<filename>")
+def adf_download(filename):
+    """Download an exported file."""
+    from flask import send_from_directory
+    safe = pathlib.Path(filename).name
+    filepath = EXPORT_DIR / safe
+    if not filepath.exists():
+        return jsonify({"error": "File not found"}), 404
+    return send_from_directory(str(EXPORT_DIR), safe, as_attachment=True)
+
+
 # --- Entry point --------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -420,6 +597,10 @@ if __name__ == "__main__":
     print("  Open: http://localhost:5000")
     print("  Press Ctrl+C to stop")
     print("=" * 60 + "\n")
+
+    # Auto-start Ollama + pre-warm model in background (non-blocking)
+    _ensure_ollama_background()
+
     os.environ.setdefault("WERKZEUG_RELOADER_EXTRA_FILES", "")
     app.run(
         debug=True,

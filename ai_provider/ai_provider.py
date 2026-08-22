@@ -56,6 +56,8 @@ _OLLAMA_URL        = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 _OLLAMA_MODEL      = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
 # Explicit override for large-input model (optional — auto-selected if blank)
 _OLLAMA_MODEL_LARGE = os.getenv("OLLAMA_MODEL_LARGE", "")
+# OLLAMA_FAST_MODE=1 → always use the small model, never auto-switch to 7b
+_OLLAMA_FAST_MODE  = os.getenv("OLLAMA_FAST_MODE", "0").strip() == "1"
 # Character threshold above which the large model is selected (~60 lines of SQL)
 # Lowered so multi-statement scripts (35+ statements) get the more capable 7b model
 _LARGE_INPUT_THRESHOLD = 2000
@@ -400,27 +402,24 @@ def _chat_ollama(system_prompt: str, user_prompt: str, temperature: float) -> st
     stored procedures fit without truncation.
     """
     total_input = len(system_prompt) + len(user_prompt)
-    is_large = total_input >= _LARGE_INPUT_THRESHOLD
-    model = _get_best_large_model() if is_large else _OLLAMA_MODEL
+    # Fast mode: always use the small/fast model regardless of input size
+    if _OLLAMA_FAST_MODE:
+        model = _OLLAMA_MODEL
+    else:
+        is_large = total_input >= _LARGE_INPUT_THRESHOLD
+        model = _get_best_large_model() if is_large else _OLLAMA_MODEL
 
     # Dynamic context window: 1 token ≈ 4 chars (conservative estimate for SQL/code)
     input_tokens_est = total_input // 4
-    # Output budget: scale with input size; extra headroom for multi-statement scripts.
-    # Each SQL statement generates ~15-25 output tokens (one spark.sql() call).
-    # Count ';' in the user_prompt as a proxy for number of statements.
     stmt_count = max(1, user_prompt.count(";"))
-    stmt_budget = stmt_count * 30   # 30 tokens per statement, generous estimate
-    if is_large:
-        output_budget = max(stmt_budget, min(6144, int(input_tokens_est * 0.8)))
-    else:
-        output_budget = max(stmt_budget, min(3072, int(input_tokens_est * 0.8)))
+    stmt_budget = stmt_count * 30
+    output_budget = max(stmt_budget, min(3072, int(input_tokens_est * 0.8)))
     output_budget = max(1200, output_budget)  # never below 1200
-    # Round ctx up to next multiple of 2048 with a safety margin
     raw_ctx = input_tokens_est + output_budget + 256
     num_ctx     = max(2048, min(32768, ((raw_ctx + 2047) // 2048) * 2048))
     num_predict = output_budget
-    # Scale timeout: assume ~7 tokens/sec worst-case on CPU, cap at 600s
-    timeout_s   = max(120, min(600, num_predict // 7))
+    # Scale timeout: assume ~10 tokens/sec worst-case on CPU, cap at 300s
+    timeout_s   = max(60, min(300, num_predict // 10))
 
     url = f"{_OLLAMA_URL}/api/chat"
     payload = json.dumps({
@@ -470,16 +469,16 @@ def _stream_ollama(system_prompt: str, user_prompt: str, temperature: float):
     Raises RuntimeError if Ollama is not reachable.
     """
     total_input = len(system_prompt) + len(user_prompt)
-    is_large = total_input >= _LARGE_INPUT_THRESHOLD
-    model = _get_best_large_model() if is_large else _OLLAMA_MODEL
-    # Same dynamic sizing as _chat_ollama
+    # Fast mode: always use the small/fast model regardless of input size
+    if _OLLAMA_FAST_MODE:
+        model = _OLLAMA_MODEL
+    else:
+        is_large = total_input >= _LARGE_INPUT_THRESHOLD
+        model = _get_best_large_model() if is_large else _OLLAMA_MODEL
     input_tokens_est = total_input // 4
     stmt_count = max(1, user_prompt.count(";"))
     stmt_budget = stmt_count * 30
-    if is_large:
-        output_budget = max(stmt_budget, min(6144, int(input_tokens_est * 0.8)))
-    else:
-        output_budget = max(stmt_budget, min(3072, int(input_tokens_est * 0.8)))
+    output_budget = max(stmt_budget, min(3072, int(input_tokens_est * 0.8)))
     output_budget = max(1200, output_budget)
     raw_ctx     = input_tokens_est + output_budget + 256
     num_ctx     = max(2048, min(32768, ((raw_ctx + 2047) // 2048) * 2048))
