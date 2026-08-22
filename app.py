@@ -539,6 +539,25 @@ def adf_page():
     return render_template("adf_export.html")
 
 
+@app.route("/adf/check-drivers")
+def adf_check_drivers():
+    """Return which DB drivers are installed and available."""
+    checks = {
+        "postgresql": ("psycopg2",    "PostgreSQL",  "5432"),
+        "sqlserver":  ("pyodbc",      "SQL Server",  "1433"),
+        "mysql":      ("pymysql",     "MySQL",       "3306"),
+        "sqlite":     ("sqlite3",     "SQLite",      ""),
+    }
+    available = []
+    for db_type, (pkg, label, port) in checks.items():
+        try:
+            __import__(pkg)
+            available.append({"value": db_type, "label": label, "port": port})
+        except ImportError:
+            pass
+    return jsonify({"available": available})
+
+
 @app.route("/adf/test-connection", methods=["POST"])
 def adf_test_connection():
     """Test database connectivity."""

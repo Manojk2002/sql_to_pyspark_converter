@@ -112,10 +112,7 @@
         <div class="form-row">
           <label>Database Type</label>
           <select id="dbType">
-            <option value="postgresql">PostgreSQL</option>
-            <option value="sqlserver">SQL Server</option>
-            <option value="mysql">MySQL</option>
-            <option value="sqlite">SQLite</option>
+            <option value="">Loading available databases...</option>
           </select>
         </div>
         <div class="form-row">
@@ -199,6 +196,26 @@ ORDER BY score DESC"></textarea>
 </div>
 
 <script>
+// Load only installed/available database drivers into the dropdown
+(function loadAvailableDrivers() {
+  fetch('/adf/check-drivers')
+    .then(r => r.json())
+    .then(data => {
+      const sel = document.getElementById('dbType');
+      sel.innerHTML = '';
+      data.available.forEach(db => {
+        const opt = document.createElement('option');
+        opt.value = db.value;
+        opt.textContent = db.label;
+        sel.appendChild(opt);
+      });
+      // Set default port for first option
+      if (data.available.length > 0) {
+        document.getElementById('dbPort').value = data.available[0].port;
+      }
+    });
+})();
+
 function getConnParams() {
   return {
     db_type:  document.getElementById('dbType').value,
