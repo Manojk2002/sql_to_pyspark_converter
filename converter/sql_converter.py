@@ -392,6 +392,28 @@ def convert_merge(stmt: SQLStatement, db_prefix: str = "my_db") -> str:
 #  Control Flow
 # ──────────────────────────────────────────────────────────────────────────────
  
+def _translate_body_line(line: str) -> str:
+    """Translate a single SQL statement line to its Python/PySpark equivalent."""
+    stripped = line.strip().rstrip(";")
+    if not stripped:
+        return ""
+    # SET @var = expr
+    if re.match(r"SET\s+@", stripped, re.IGNORECASE):
+        return convert_set_statement(stripped)
+    # RAISERROR('msg', ...)
+    m_err = re.match(r"RAISERROR\s*\(\s*N?'([^']+)'.*", stripped, re.IGNORECASE)
+    if m_err:
+        return f"raise ValueError(\"{m_err.group(1)}\")"
+    # RETURN (bare)
+    if re.match(r"^RETURN\s*$", stripped, re.IGNORECASE):
+        return "return"
+    # PRINT → logger.info
+    m_print = re.match(r"PRINT\s+(.+)", stripped, re.IGNORECASE)
+    if m_print:
+        return f"logger.info({m_print.group(1).strip()})"
+    return line.rstrip(";")
+
+
 def convert_if_else(stmt: SQLStatement) -> str:
     raw = stmt.raw_sql.strip()
     # Extract condition between IF and BEGIN
@@ -406,28 +428,32 @@ def convert_if_else(stmt: SQLStatement) -> str:
         py_cond    = _translate_sql_condition(condition)
         lines      = [f"if {py_cond}:"]
         for line in true_block.split("\n"):
-            lines.append(f"    {line}")
+            translated = _translate_body_line(line)
+            if translated:
+                lines.append(f"    {translated}")
         if else_block:
             lines.append("else:")
             for line in else_block.split("\n"):
-                lines.append(f"    {line}")
+                translated = _translate_body_line(line)
+                if translated:
+                    lines.append(f"    {translated}")
         return "\n".join(lines)
- 
+
     # Inline IF (no BEGIN/END)
     m2 = re.match(r"IF\s+(.+?)\s*\n(.+)", raw, re.IGNORECASE | re.DOTALL)
     if m2:
         condition  = m2.group(1).strip()
         body       = m2.group(2).strip()
         py_cond    = _translate_sql_condition(condition)
-        return f"if {py_cond}:\n    {body}"
- 
+        return f"if {py_cond}:\n    {_translate_body_line(body)}"
+
     return (
         f"# SQL IF/ELSE — manual conversion required\n"
         f"# Original:\n"
         + "\n".join(f"# {l}" for l in raw.split("\n"))
     )
- 
- 
+
+
 def _translate_sql_condition(cond: str) -> str:
     """Translate a SQL boolean condition to Python."""
     cond = cond.strip()
