@@ -77,7 +77,11 @@ def build_connection_string(
         )
 
     if db_type_lower == "sqlite":
-        return f"sqlite:///{database}"
+        # Resolve relative paths to absolute so SQLite always finds the right file
+        db_path = pathlib.Path(database)
+        if not db_path.is_absolute():
+            db_path = pathlib.Path(__file__).parent.parent / database
+        return f"sqlite:///{db_path.resolve()}"
 
     if db_type_lower in ("sqlserver", "azuresql"):
         # SQL Server / Azure SQL need ODBC driver specification
